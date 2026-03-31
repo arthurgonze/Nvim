@@ -23,6 +23,8 @@ return {
 
     -- Add your own debuggers here
     'leoluz/nvim-dap-go',
+    'theHamsta/nvim-dap-virtual-text',
+    'mfussenegger/nvim-dap-python',
   },
   keys = {
     -- Basic debugging keymaps, feel free to change to your liking!

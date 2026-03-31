@@ -1,0 +1,3494 @@
+SCRIPT  C:/Users/User/AppData/Local/nvim-data/lazy/neo-tree.nvim/plugin/neo-tree.lua
+Sourced 1 time
+Total time:   0.000427
+ Self time:   0.000427
+
+count  total (s)   self (s)
+                            if vim.g.loaded_neo_tree == 1 or vim.g.loaded_neo_tree == true then
+                              return
+                            end
+                            
+                            -- Possibly convert this to lua using customlist instead of custom in the future?
+                            vim.api.nvim_create_user_command("Neotree", function(ctx)
+                              require("neo-tree.command")._command(unpack(ctx.fargs))
+                            end, {
+                              nargs = "*",
+                              complete = "custom,v:lua.require'neo-tree.command'.complete_args",
+                            })
+                            
+                            ---@param path string? The path to check
+                            ---@return boolean hijacked Whether we hijacked a buffer
+                            local function try_netrw_hijack(path)
+                              if not path or #path == 0 then
+                                return false
+                              end
+                            
+                              local stats = (vim.uv or vim.loop).fs_stat(path)
+                              if not stats or stats.type ~= "directory" then
+                                return false
+                              end
+                            
+                              return require("neo-tree.setup.netrw").hijack()
+                            end
+                            
+                            local augroup = vim.api.nvim_create_augroup("NeoTree", { clear = true })
+                            
+                            -- lazy load until bufenter/netrw hijack
+                            vim.api.nvim_create_autocmd({ "BufEnter" }, {
+                              group = augroup,
+                              desc = "Lazy-load until bufenter/opened dir",
+                              callback = function(args)
+                                return vim.g.neotree_watching_bufenter == 1 or try_netrw_hijack(args.file)
+                              end,
+                            })
+                            
+                            -- track window order
+                            vim.api.nvim_create_autocmd({ "WinEnter" }, {
+                              group = augroup,
+                              desc = "Track prior windows for opening intuitiveness",
+                              callback = function(ev)
+                                local win = vim.api.nvim_get_current_win()
+                                local utils = require("neo-tree.utils")
+                                if utils.is_floating(win) then
+                                  return
+                                end
+                            
+                                if vim.bo[ev.buf].filetype == "neo-tree" then
+                                  return
+                                end
+                            
+                                local tabid = vim.api.nvim_get_current_tabpage()
+                                utils.prior_windows[tabid] = utils.prior_windows[tabid] or {}
+                                local tab_windows = utils.prior_windows[tabid]
+                                table.insert(tab_windows, win)
+                            
+                                -- prune history
+                                local win_count = #tab_windows
+                                if win_count > 100 then
+                                  ---@diagnostic disable-next-line: deprecated
+                                  if table.move then
+                                    utils.prior_windows[tabid] =
+                                      require("neo-tree.utils._compat").luajit.table_move(tab_windows, 80, win_count, 1, {})
+                                    return
+                                  end
+                            
+                                  local new_array = {}
+                                  for i = 80, win_count do
+                                    table.insert(new_array, tab_windows[i])
+                                  end
+                                  utils.prior_windows[tabid] = new_array
+                                end
+                              end,
+                            })
+                            
+                            -- setup session loading
+                            vim.api.nvim_create_autocmd("SessionLoadPost", {
+                              group = augroup,
+                              desc = "Session loading",
+                              callback = function()
+                                if require("neo-tree").ensure_config().auto_clean_after_session_restore then
+                                  require("neo-tree.ui.renderer").clean_invalid_neotree_buffers(true)
+                                end
+                              end,
+                            })
+                            
+                            vim.api.nvim_create_autocmd("WinClosed", {
+                              group = augroup,
+                              desc = "close_if_last_window autocmd",
+                              callback = function(args)
+                                local closing_win = tonumber(args.match)
+                                local visible_winids = vim.api.nvim_tabpage_list_wins(0)
+                                local other_panes = {}
+                                local utils = require("neo-tree.utils")
+                                for _, winid in ipairs(visible_winids) do
+                                  if not utils.is_floating(winid) and winid ~= closing_win then
+                                    other_panes[#other_panes + 1] = winid
+                                  end
+                                end
+                            
+                                if #other_panes ~= 1 then
+                                  return
+                                end
+                            
+                                local remaining_pane = other_panes[1]
+                                local remaining_buf = vim.api.nvim_win_get_buf(remaining_pane)
+                            
+                                if vim.bo[remaining_buf].filetype ~= "neo-tree" then
+                                  return
+                                end
+                            
+                                local position = vim.b[remaining_buf].neo_tree_position
+                                local source = vim.b[remaining_buf].neo_tree_source
+                                -- close_if_last_window just doesn't make sense for a split style
+                                if position == "current" then
+                                  return
+                                end
+                            
+                                local log = require("neo-tree.log")
+                                log.trace("last window, closing")
+                                local state = require("neo-tree.sources.manager").get_state(source)
+                                if not state then
+                                  return
+                                end
+                                if not require("neo-tree").ensure_config().close_if_last_window then
+                                  return
+                                end
+                                local mod = utils.get_opened_buffers()
+                                log.debug("close_if_last_window, modified files found:", vim.inspect(mod))
+                                for filename, buf_info in pairs(mod) do
+                                  if buf_info.modified then
+                                    local buf_name, message
+                                    if vim.startswith(filename, "[No Name]#") then
+                                      buf_name = string.sub(filename, 11)
+                                      message =
+                                        "Cannot close because an unnamed buffer is modified. Please save or discard this file."
+                                    else
+                                      buf_name = filename
+                                      message =
+                                        "Cannot close because one of the files is modified. Please save or discard changes."
+                                    end
+                                    log.trace("close_if_last_window, showing unnamed modified buffer:", filename)
+                                    vim.schedule(function()
+                                      log.warn(message)
+                                      vim.cmd("rightbelow vertical split")
+                                      vim.api.nvim_win_set_width(remaining_pane, state.window.width or 40)
+                                      vim.cmd("b " .. buf_name)
+                                    end)
+                                    return
+                                  end
+                                end
+                                -- this needs to be scheduled, otherwise VimLeavePre autocmds won't trigger
+                                vim.schedule(function()
+                                  vim.cmd("q!")
+                                end)
+                              end,
+                            })
+                            
+                            vim.g.loaded_neo_tree = 1
+
+SCRIPT  C:\Program Files\Neovim\share\nvim\runtime\ftplugin\lua.vim
+Sourced 1 time
+Total time:   0.000139
+ Self time:   0.000139
+
+count  total (s)   self (s)
+                            " Vim filetype plugin file.
+                            " Language:		Lua
+                            " Maintainer:		Doug Kearns <dougkearns@gmail.com>
+                            " Previous Maintainer:	Max Ischenko <mfi@ukr.net>
+                            " Contributor:		Dorai Sitaram <ds26@gte.com>
+                            "			C.D. MacEachern <craig.daniel.maceachern@gmail.com>
+                            "			Phạm Bình An <phambinhanctb2004@gmail.com>
+                            "			@konfekt
+                            " Last Change:		2025 Apr 04
+                            " 2025 May 06 by Vim Project update 'path' setting #17267
+                            
+    1              0.000005 if exists("b:did_ftplugin")
+                              finish
+    1              0.000001 endif
+    1              0.000003 let b:did_ftplugin = 1
+                            
+                            " keep in sync with syntax/lua.vim
+    1              0.000002 if !exists("lua_version")
+                              " Default is lua 5.3
+    1              0.000001   let lua_version = 5
+    1              0.000001   let lua_subversion = 3
+                            elseif !exists("lua_subversion")
+                              " lua_version exists, but lua_subversion doesn't. In this case set it to 0
+                              let lua_subversion = 0
+    1              0.000000 endif
+                            
+    1              0.000002 let s:cpo_save = &cpo
+    1              0.000005 set cpo&vim
+                            
+    1              0.000003 setlocal comments=:---,:--
+    1              0.000003 setlocal commentstring=--\ %s
+    1              0.000004 setlocal formatoptions-=t formatoptions+=croql
+    1              0.000002 setlocal path-=. " Lua doesn't support importing module in path related to current file like JS
+                            
+    1              0.000003 let &l:define = '\<function\|\<local\%(\s\+function\)\='
+                            
+    1              0.000002 let &l:include = '\<\%(\%(do\|load\)file\|require\)\s*('
+    1              0.000003 setlocal includeexpr=s:LuaInclude(v:fname)
+    1              0.000002 setlocal suffixesadd=.lua
+                            
+    1              0.000001 let b:undo_ftplugin = "setl cms< com< def< fo< inc< inex< sua< pa<"
+                            
+    1              0.000003 if exists("loaded_matchit") && !exists("b:match_words")
+    1              0.000001   let b:match_ignorecase = 0
+    1              0.000005   let b:match_words =
+                            	\ '\<\%(do\|function\|if\)\>:' ..
+                            	\ '\<\%(return\|else\|elseif\)\>:' ..
+                            	\ '\<end\>,' ..
+                            	\ '\<repeat\>:\<until\>,' ..
+                            	\ '\%(--\)\=\[\(=*\)\[:]\1]'
+    1              0.000002   let b:undo_ftplugin ..= " | unlet! b:match_words b:match_ignorecase"
+    1              0.000000 endif
+                            
+    1              0.000015 if (has("gui_win32") || has("gui_gtk")) && !exists("b:browsefilter")
+                              let b:browsefilter = "Lua Source Files (*.lua)\t*.lua\n"
+                              if has("win32")
+                                let b:browsefilter ..= "All Files (*.*)\t*\n"
+                              else
+                                let b:browsefilter ..= "All Files (*)\t*\n"
+                              endif
+                              let b:undo_ftplugin ..= " | unlet! b:browsefilter"
+    1              0.000000 endif
+                            
+                            " The rest of the file needs to be :sourced only once per Vim session
+    1              0.000002 if exists("s:loaded_lua") || &cp
+                              let &cpo = s:cpo_save
+                              unlet s:cpo_save
+                              finish
+    1              0.000000 endif
+    1              0.000001 let s:loaded_lua = 1
+                            
+    1              0.000002 function s:LuaInclude(fname) abort
+                              let lua_ver = str2float(printf("%d.%02d", g:lua_version, g:lua_subversion))
+                              let fname = tr(a:fname, '.', '/')
+                              let paths = lua_ver >= 5.03 ? [fname .. ".lua", fname .. "/init.lua"] : [fname .. ".lua"]
+                              for path in paths
+                                if filereadable(path)
+                                  return path
+                                endif
+                              endfor
+                              return fname
+                            endfunction
+                            
+    1              0.000002 let &cpo = s:cpo_save
+    1              0.000001 unlet s:cpo_save
+                            
+                            " vim: nowrap sw=2 sts=2 ts=8 noet:
+
+SCRIPT  C:\Program Files\Neovim\share\nvim\runtime\ftplugin\lua.lua
+Sourced 1 time
+Total time:   0.013671
+ Self time:   0.013565
+
+count  total (s)   self (s)
+                            -- use treesitter over syntax
+                            vim.treesitter.start()
+                            
+                            vim.bo.includeexpr = [[v:lua.require'vim._ftplugin.lua'.includeexpr(v:fname)]]
+                            vim.bo.omnifunc = 'v:lua.vim.lua_omnifunc'
+                            vim.wo[0][0].foldexpr = 'v:lua.vim.treesitter.foldexpr()'
+                            
+                            vim.b.undo_ftplugin = (vim.b.undo_ftplugin or '')
+                              .. '\n call v:lua.vim.treesitter.stop()'
+                              .. '\n setl omnifunc< foldexpr< includeexpr<'
+
+SCRIPT  C:\Program Files\Neovim\share\nvim\runtime\indent\lua.vim
+Sourced 1 time
+Total time:   0.000082
+ Self time:   0.000082
+
+count  total (s)   self (s)
+                            " Vim indent file
+                            " Language:	Lua script
+                            " Maintainer:	Marcus Aurelius Farias <marcus.cf 'at' bol.com.br>
+                            " First Author:	Max Ischenko <mfi 'at' ukr.net>
+                            " Last Change:	2017 Jun 13
+                            "		2022 Sep 07: b:undo_indent added by Doug Kearns
+                            "		2024 Jul 27: by Vim project: match '(', ')' in function GetLuaIndentIntern()
+                            
+                            " Only load this indent file when no other was loaded.
+    1              0.000004 if exists("b:did_indent")
+                              finish
+    1              0.000000 endif
+    1              0.000002 let b:did_indent = 1
+                            
+    1              0.000005 setlocal indentexpr=GetLuaIndent()
+                            
+                            " To make Vim call GetLuaIndent() when it finds '\s*end' or '\s*until'
+                            " on the current line ('else' is default and includes 'elseif').
+    1              0.000003 setlocal indentkeys+=0=end,0=until
+                            
+    1              0.000002 setlocal autoindent
+                            
+    1              0.000001 let b:undo_indent = "setlocal autoindent< indentexpr< indentkeys<"
+                            
+                            " Only define the function once.
+    1              0.000003 if exists("*GetLuaIndent")
+                              finish
+    1              0.000000 endif
+                            
+    1              0.000001 function! GetLuaIndent()
+                                let ignorecase_save = &ignorecase
+                              try
+                                let &ignorecase = 0
+                                return GetLuaIndentIntern()
+                              finally
+                                let &ignorecase = ignorecase_save
+                              endtry
+                            endfunction
+                            
+    1              0.000001 function! GetLuaIndentIntern()
+                              " Find a non-blank line above the current line.
+                              let prevlnum = prevnonblank(v:lnum - 1)
+                            
+                              " Hit the start of the file, use zero indent.
+                              if prevlnum == 0
+                                return 0
+                              endif
+                            
+                              " Add a 'shiftwidth' after lines that start a block:
+                              " 'function', 'if', 'for', 'while', 'repeat', 'else', 'elseif', '{', '('
+                              let ind = indent(prevlnum)
+                              let prevline = getline(prevlnum)
+                              let midx = match(prevline, '^\s*\%(if\>\|for\>\|while\>\|repeat\>\|else\>\|elseif\>\|do\>\|then\>\)')
+                              if midx == -1
+                                let midx = match(prevline, '\%({\|(\)\s*\%(--\%([^[].*\)\?\)\?$')
+                                if midx == -1
+                                  let midx = match(prevline, '\<function\>\s*\%(\k\|[.:]\)\{-}\s*(')
+                                endif
+                              endif
+                            
+                              if midx != -1
+                                " Add 'shiftwidth' if what we found previously is not in a comment and
+                                " an "end" or "until" is not present on the same line.
+                                if synIDattr(synID(prevlnum, midx + 1, 1), "name") != "luaComment" && prevline !~ '\<end\>\|\<until\>'
+                                  let ind = ind + shiftwidth()
+                                endif
+                              endif
+                            
+                              " Subtract a 'shiftwidth' on end, else, elseif, until, '}' and ')'
+                              " This is the part that requires 'indentkeys'.
+                              let midx = match(getline(v:lnum), '^\s*\%(end\>\|else\>\|elseif\>\|until\>\|}\|)\)')
+                              if midx != -1 && synIDattr(synID(v:lnum, midx + 1, 1), "name") != "luaComment"
+                                let ind = ind - shiftwidth()
+                              endif
+                            
+                              return ind
+                            endfunction
+
+SCRIPT  C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim
+Sourced 1 time
+Total time:   0.000453
+ Self time:   0.000407
+
+count  total (s)   self (s)
+                            "  matchit.vim: (global plugin) Extended "%" matching
+                            "  autload script of matchit plugin, see ../plugin/matchit.vim
+                            "  Last Change: May 20, 2024
+                            
+                            " Neovim does not support scriptversion
+    1              0.000014 if has("vimscript-4")
+                              scriptversion 4
+    1              0.000001 endif
+                            
+    1              0.000003 let s:last_mps = ""
+    1              0.000001 let s:last_words = ":"
+    1              0.000001 let s:patBR = ""
+                            
+    1              0.000002 let s:save_cpo = &cpo
+    1   0.000033   0.000006 set cpo&vim
+                            
+                            " Auto-complete mappings:  (not yet "ready for prime time")
+                            " TODO Read :help write-plugin for the "right" way to let the user
+                            " specify a key binding.
+                            "   let g:match_auto = '<C-]>'
+                            "   let g:match_autoCR = '<C-CR>'
+                            " if exists("g:match_auto")
+                            "   execute "inoremap " . g:match_auto . ' x<Esc>"=<SID>Autocomplete()<CR>Pls'
+                            " endif
+                            " if exists("g:match_autoCR")
+                            "   execute "inoremap " . g:match_autoCR . ' <CR><C-R>=<SID>Autocomplete()<CR>'
+                            " endif
+                            " if exists("g:match_gthhoh")
+                            "   execute "inoremap " . g:match_gthhoh . ' <C-O>:call <SID>Gthhoh()<CR>'
+                            " endif " gthhoh = "Get the heck out of here!"
+                            
+    1              0.000001 let s:notslash = '\\\@1<!\%(\\\\\)*'
+                            
+    1              0.000003 function s:RestoreOptions()
+                              " In s:CleanUp(), :execute "set" restore_options .
+                              let restore_options = ""
+                              if get(b:, 'match_ignorecase', &ic) != &ic
+                                let restore_options ..= (&ic ? " " : " no") .. "ignorecase"
+                                let &ignorecase = b:match_ignorecase
+                              endif
+                              if &ve != ''
+                                let restore_options = " ve=" .. &ve .. restore_options
+                                set ve=
+                              endif
+                              if &smartcase
+                                let restore_options = " smartcase " .. restore_options
+                                set nosmartcase
+                              endif
+                              return restore_options
+                            endfunction
+                            
+    1              0.000002 function matchit#Match_wrapper(word, forward, mode) range
+                              let restore_options = s:RestoreOptions()
+                              " In s:CleanUp(), we may need to check whether the cursor moved forward.
+                              let startpos = [line("."), col(".")]
+                              " if a count has been applied, use the default [count]% mode (see :h N%)
+                              if v:count
+                                exe "normal! " .. v:count .. "%"
+                                return s:CleanUp(restore_options, a:mode, startpos)
+                              end
+                              if a:mode =~# "v" && mode(1) =~# 'ni'
+                                exe "norm! gv"
+                              elseif a:mode == "o" && mode(1) !~# '[vV]'
+                                exe "norm! v"
+                              " If this function was called from Visual mode, make sure that the cursor
+                              " is at the correct end of the Visual range:
+                              elseif a:mode == "v"
+                                execute "normal! gv\<Esc>"
+                                let startpos = [line("."), col(".")]
+                              endif
+                            
+                              " First step:  if not already done, set the script variables
+                              "   s:do_BR   flag for whether there are backrefs
+                              "   s:pat     parsed version of b:match_words
+                              "   s:all     regexp based on s:pat and the default groups
+                              if !exists("b:match_words") || b:match_words == ""
+                                let match_words = ""
+                              elseif b:match_words =~ ":"
+                                let match_words = b:match_words
+                              else
+                                " Allow b:match_words = "GetVimMatchWords()" .
+                                execute "let match_words =" b:match_words
+                              endif
+                            " Thanks to Preben "Peppe" Guldberg and Bram Moolenaar for this suggestion!
+                              if (match_words != s:last_words) || (&mps != s:last_mps)
+                                  \ || exists("b:match_debug")
+                                let s:last_mps = &mps
+                                " quote the special chars in 'matchpairs', replace [,:] with \| and then
+                                " append the builtin pairs (/*, */, #if, #ifdef, #ifndef, #else, #elif,
+                                " #elifdef, #elifndef, #endif)
+                                let default = escape(&mps, '[$^.*~\\/?]') .. (strlen(&mps) ? "," : "") ..
+                                  \ '\/\*:\*\/,#\s*if\%(n\=def\)\=:#\s*else\>:#\s*elif\%(n\=def\)\=\>:#\s*endif\>'
+                                " s:all = pattern with all the keywords
+                                let match_words = match_words .. (strlen(match_words) ? "," : "") .. default
+                                let s:last_words = match_words
+                                if match_words !~ s:notslash .. '\\\d'
+                                  let s:do_BR = 0
+                                  let s:pat = match_words
+                                else
+                                  let s:do_BR = 1
+                                  let s:pat = s:ParseWords(match_words)
+                                endif
+                                let s:all = substitute(s:pat, s:notslash .. '\zs[,:]\+', '\\|', 'g')
+                                " un-escape \, to ,
+                                let s:all = substitute(s:all, '\\,', ',', 'g')
+                                " Just in case there are too many '\(...)' groups inside the pattern, make
+                                " sure to use \%(...) groups, so that error E872 can be avoided
+                                let s:all = substitute(s:all, '\\(', '\\%(', 'g')
+                                let s:all = '\%(' .. s:all .. '\)'
+                                if exists("b:match_debug")
+                                  let b:match_pat = s:pat
+                                endif
+                                " Reconstruct the version with unresolved backrefs.
+                                let s:patBR = substitute(match_words .. ',',
+                                  \ s:notslash .. '\zs[,:]*,[,:]*', ',', 'g')
+                                let s:patBR = substitute(s:patBR, s:notslash .. '\zs:\{2,}', ':', 'g')
+                                " un-escape \, to ,
+                                let s:patBR = substitute(s:patBR, '\\,', ',', 'g')
+                              endif
+                            
+                              " Second step:  set the following local variables:
+                              "     matchline = line on which the cursor started
+                              "     curcol    = number of characters before match
+                              "     prefix    = regexp for start of line to start of match
+                              "     suffix    = regexp for end of match to end of line
+                              " Require match to end on or after the cursor and prefer it to
+                              " start on or before the cursor.
+                              let matchline = getline(startpos[0])
+                              if a:word != ''
+                                " word given
+                                if a:word !~ s:all
+                                  echohl WarningMsg|echo 'Missing rule for word:"'.a:word.'"'|echohl NONE
+                                  return s:CleanUp(restore_options, a:mode, startpos)
+                                endif
+                                let matchline = a:word
+                                let curcol = 0
+                                let prefix = '^\%('
+                                let suffix = '\)$'
+                              " Now the case when "word" is not given
+                              else  " Find the match that ends on or after the cursor and set curcol.
+                                let regexp = s:Wholematch(matchline, s:all, startpos[1]-1)
+                                let curcol = match(matchline, regexp)
+                                " If there is no match, give up.
+                                if curcol == -1
+                                  return s:CleanUp(restore_options, a:mode, startpos)
+                                endif
+                                let endcol = matchend(matchline, regexp)
+                                let suf = strlen(matchline) - endcol
+                                let prefix = (curcol ? '^.*\%' .. (curcol + 1) .. 'c\%(' : '^\%(')
+                                let suffix = (suf ? '\)\%' .. (endcol + 1) .. 'c.*$'  : '\)$')
+                              endif
+                              if exists("b:match_debug")
+                                let b:match_match = matchstr(matchline, regexp)
+                                let b:match_col = curcol+1
+                              endif
+                            
+                              " Third step:  Find the group and single word that match, and the original
+                              " (backref) versions of these.  Then, resolve the backrefs.
+                              " Set the following local variable:
+                              " group = colon-separated list of patterns, one of which matches
+                              "       = ini:mid:fin or ini:fin
+                              "
+                              " Now, set group and groupBR to the matching group: 'if:endif' or
+                              " 'while:endwhile' or whatever.  A bit of a kluge:  s:Choose() returns
+                              " group . "," . groupBR, and we pick it apart.
+                              let group = s:Choose(s:pat, matchline, ",", ":", prefix, suffix, s:patBR)
+                              let i = matchend(group, s:notslash .. ",")
+                              let groupBR = strpart(group, i)
+                              let group = strpart(group, 0, i-1)
+                              " Now, matchline =~ prefix . substitute(group,':','\|','g') . suffix
+                              if s:do_BR " Do the hard part:  resolve those backrefs!
+                                let group = s:InsertRefs(groupBR, prefix, group, suffix, matchline)
+                              endif
+                              if exists("b:match_debug")
+                                let b:match_wholeBR = groupBR
+                                let i = matchend(groupBR, s:notslash .. ":")
+                                let b:match_iniBR = strpart(groupBR, 0, i-1)
+                              endif
+                            
+                              " Fourth step:  Set the arguments for searchpair().
+                              let i = matchend(group, s:notslash .. ":")
+                              let j = matchend(group, '.*' .. s:notslash .. ":")
+                              let ini = strpart(group, 0, i-1)
+                              let mid = substitute(strpart(group, i,j-i-1), s:notslash .. '\zs:', '\\|', 'g')
+                              let fin = strpart(group, j)
+                              "Un-escape the remaining , and : characters.
+                              let ini = substitute(ini, s:notslash .. '\zs\\\(:\|,\)', '\1', 'g')
+                              let mid = substitute(mid, s:notslash .. '\zs\\\(:\|,\)', '\1', 'g')
+                              let fin = substitute(fin, s:notslash .. '\zs\\\(:\|,\)', '\1', 'g')
+                              " searchpair() requires that these patterns avoid \(\) groups.
+                              let ini = substitute(ini, s:notslash .. '\zs\\(', '\\%(', 'g')
+                              let mid = substitute(mid, s:notslash .. '\zs\\(', '\\%(', 'g')
+                              let fin = substitute(fin, s:notslash .. '\zs\\(', '\\%(', 'g')
+                              " Set mid.  This is optimized for readability, not micro-efficiency!
+                              if a:forward && matchline =~ prefix .. fin .. suffix
+                                \ || !a:forward && matchline =~ prefix .. ini .. suffix
+                                let mid = ""
+                              endif
+                              " Set flag.  This is optimized for readability, not micro-efficiency!
+                              if a:forward && matchline =~ prefix .. fin .. suffix
+                                \ || !a:forward && matchline !~ prefix .. ini .. suffix
+                                let flag = "bW"
+                              else
+                                let flag = "W"
+                              endif
+                              " Set skip.
+                              if exists("b:match_skip")
+                                let skip = b:match_skip
+                              elseif exists("b:match_comment") " backwards compatibility and testing!
+                                let skip = "r:" .. b:match_comment
+                              else
+                                let skip = 's:comment\|string'
+                              endif
+                              let skip = s:ParseSkip(skip)
+                              if exists("b:match_debug")
+                                let b:match_ini = ini
+                                let b:match_tail = (strlen(mid) ? mid .. '\|' : '') .. fin
+                              endif
+                            
+                              " Fifth step:  actually start moving the cursor and call searchpair().
+                              " Later, :execute restore_cursor to get to the original screen.
+                              let view = winsaveview()
+                              call cursor(0, curcol + 1)
+                              if skip =~ 'synID' && !(has("syntax") && exists("g:syntax_on"))
+                                    \ || skip =~ 'v:lua.vim.treesitter' && !exists('b:ts_highlight')
+                                let skip = "0"
+                              else
+                                execute "if " .. skip .. "| let skip = '0' | endif"
+                              endif
+                              let sp_return = searchpair(ini, mid, fin, flag, skip)
+                              if &selection isnot# 'inclusive' && a:mode == 'v'
+                                " move cursor one pos to the right, because selection is not inclusive
+                                " add virtualedit=onemore, to make it work even when the match ends the
+                                " line
+                                if !(col('.') < col('$')-1)
+                                  let eolmark=1 " flag to set a mark on eol (since we cannot move there)
+                                endif
+                                norm! l
+                              endif
+                              let final_position = "call cursor(" .. line(".") .. "," .. col(".") .. ")"
+                              " Restore cursor position and original screen.
+                              call winrestview(view)
+                              normal! m'
+                              if sp_return > 0
+                                execute final_position
+                              endif
+                              if exists('eolmark') && eolmark
+                                call setpos("''", [0, line('.'), col('$'), 0]) " set mark on the eol
+                              endif
+                              return s:CleanUp(restore_options, a:mode, startpos, mid .. '\|' .. fin)
+                            endfun
+                            
+                            " Restore options and do some special handling for Operator-pending mode.
+                            " The optional argument is the tail of the matching group.
+    1              0.000002 fun! s:CleanUp(options, mode, startpos, ...)
+                              if strlen(a:options)
+                                execute "set" a:options
+                              endif
+                              " Open folds, if appropriate.
+                              if a:mode != "o"
+                                if &foldopen =~ "percent"
+                                  normal! zv
+                                endif
+                                " In Operator-pending mode, we want to include the whole match
+                                " (for example, d%).
+                                " This is only a problem if we end up moving in the forward direction.
+                              elseif (a:startpos[0] < line(".")) ||
+                                    \ (a:startpos[0] == line(".") && a:startpos[1] < col("."))
+                                if a:0
+                                  " Check whether the match is a single character.  If not, move to the
+                                  " end of the match.
+                                  let matchline = getline(".")
+                                  let currcol = col(".")
+                                  let regexp = s:Wholematch(matchline, a:1, currcol-1)
+                                  let endcol = matchend(matchline, regexp)
+                                  if endcol > currcol  " This is NOT off by one!
+                                    call cursor(0, endcol)
+                                  endif
+                                endif " a:0
+                              endif " a:mode != "o" && etc.
+                              return 0
+                            endfun
+                            
+                            " Example (simplified HTML patterns):  if
+                            "   a:groupBR   = '<\(\k\+\)>:</\1>'
+                            "   a:prefix    = '^.\{3}\('
+                            "   a:group     = '<\(\k\+\)>:</\(\k\+\)>'
+                            "   a:suffix    = '\).\{2}$'
+                            "   a:matchline =  "123<tag>12" or "123</tag>12"
+                            " then extract "tag" from a:matchline and return "<tag>:</tag>" .
+    1              0.000002 fun! s:InsertRefs(groupBR, prefix, group, suffix, matchline)
+                              if a:matchline !~ a:prefix ..
+                                \ substitute(a:group, s:notslash .. '\zs:', '\\|', 'g') .. a:suffix
+                                return a:group
+                              endif
+                              let i = matchend(a:groupBR, s:notslash .. ':')
+                              let ini = strpart(a:groupBR, 0, i-1)
+                              let tailBR = strpart(a:groupBR, i)
+                              let word = s:Choose(a:group, a:matchline, ":", "", a:prefix, a:suffix,
+                                \ a:groupBR)
+                              let i = matchend(word, s:notslash .. ":")
+                              let wordBR = strpart(word, i)
+                              let word = strpart(word, 0, i-1)
+                              " Now, a:matchline =~ a:prefix . word . a:suffix
+                              if wordBR != ini
+                                let table = s:Resolve(ini, wordBR, "table")
+                              else
+                                let table = ""
+                                let d = 0
+                                while d < 10
+                                  if tailBR =~ s:notslash .. '\\' .. d
+                                    let table = table .. d
+                                  else
+                                    let table = table .. "-"
+                                  endif
+                                  let d = d + 1
+                                endwhile
+                              endif
+                              let d = 9
+                              while d
+                                if table[d] != "-"
+                                  let backref = substitute(a:matchline, a:prefix .. word .. a:suffix,
+                                    \ '\' .. table[d], "")
+                                    " Are there any other characters that should be escaped?
+                                  let backref = escape(backref, '*,:')
+                                  execute s:Ref(ini, d, "start", "len")
+                                  let ini = strpart(ini, 0, start) .. backref .. strpart(ini, start+len)
+                                  let tailBR = substitute(tailBR, s:notslash .. '\zs\\' .. d,
+                                    \ escape(backref, '\\&'), 'g')
+                                endif
+                                let d = d-1
+                              endwhile
+                              if exists("b:match_debug")
+                                if s:do_BR
+                                  let b:match_table = table
+                                  let b:match_word = word
+                                else
+                                  let b:match_table = ""
+                                  let b:match_word = ""
+                                endif
+                              endif
+                              return ini .. ":" .. tailBR
+                            endfun
+                            
+                            " Input a comma-separated list of groups with backrefs, such as
+                            "   a:groups = '\(foo\):end\1,\(bar\):end\1'
+                            " and return a comma-separated list of groups with backrefs replaced:
+                            "   return '\(foo\):end\(foo\),\(bar\):end\(bar\)'
+    1              0.000001 fun! s:ParseWords(groups)
+                              let groups = substitute(a:groups .. ",", s:notslash .. '\zs[,:]*,[,:]*', ',', 'g')
+                              let groups = substitute(groups, s:notslash .. '\zs:\{2,}', ':', 'g')
+                              let parsed = ""
+                              while groups =~ '[^,:]'
+                                let i = matchend(groups, s:notslash .. ':')
+                                let j = matchend(groups, s:notslash .. ',')
+                                let ini = strpart(groups, 0, i-1)
+                                let tail = strpart(groups, i, j-i-1) .. ":"
+                                let groups = strpart(groups, j)
+                                let parsed = parsed .. ini
+                                let i = matchend(tail, s:notslash .. ':')
+                                while i != -1
+                                  " In 'if:else:endif', ini='if' and word='else' and then word='endif'.
+                                  let word = strpart(tail, 0, i-1)
+                                  let tail = strpart(tail, i)
+                                  let i = matchend(tail, s:notslash .. ':')
+                                  let parsed = parsed .. ":" .. s:Resolve(ini, word, "word")
+                                endwhile " Now, tail has been used up.
+                                let parsed = parsed .. ","
+                              endwhile " groups =~ '[^,:]'
+                              let parsed = substitute(parsed, ',$', '', '')
+                              return parsed
+                            endfun
+                            
+                            " TODO I think this can be simplified and/or made more efficient.
+                            " TODO What should I do if a:start is out of range?
+                            " Return a regexp that matches all of a:string, such that
+                            " matchstr(a:string, regexp) represents the match for a:pat that starts
+                            " as close to a:start as possible, before being preferred to after, and
+                            " ends after a:start .
+                            " Usage:
+                            " let regexp = s:Wholematch(getline("."), 'foo\|bar', col(".")-1)
+                            " let i      = match(getline("."), regexp)
+                            " let j      = matchend(getline("."), regexp)
+                            " let match  = matchstr(getline("."), regexp)
+    1              0.000001 fun! s:Wholematch(string, pat, start)
+                              let group = '\%(' .. a:pat .. '\)'
+                              let prefix = (a:start ? '\(^.*\%<' .. (a:start + 2) .. 'c\)\zs' : '^')
+                              let len = strlen(a:string)
+                              let suffix = (a:start+1 < len ? '\(\%>' .. (a:start+1) .. 'c.*$\)\@=' : '$')
+                              if a:string !~ prefix .. group .. suffix
+                                let prefix = ''
+                              endif
+                              return prefix .. group .. suffix
+                            endfun
+                            
+                            " No extra arguments:  s:Ref(string, d) will
+                            " find the d'th occurrence of '\(' and return it, along with everything up
+                            " to and including the matching '\)'.
+                            " One argument:  s:Ref(string, d, "start") returns the index of the start
+                            " of the d'th '\(' and any other argument returns the length of the group.
+                            " Two arguments:  s:Ref(string, d, "foo", "bar") returns a string to be
+                            " executed, having the effect of
+                            "   :let foo = s:Ref(string, d, "start")
+                            "   :let bar = s:Ref(string, d, "len")
+    1              0.000001 fun! s:Ref(string, d, ...)
+                              let len = strlen(a:string)
+                              if a:d == 0
+                                let start = 0
+                              else
+                                let cnt = a:d
+                                let match = a:string
+                                while cnt
+                                  let cnt = cnt - 1
+                                  let index = matchend(match, s:notslash .. '\\(')
+                                  if index == -1
+                                    return ""
+                                  endif
+                                  let match = strpart(match, index)
+                                endwhile
+                                let start = len - strlen(match)
+                                if a:0 == 1 && a:1 == "start"
+                                  return start - 2
+                                endif
+                                let cnt = 1
+                                while cnt
+                                  let index = matchend(match, s:notslash .. '\\(\|\\)') - 1
+                                  if index == -2
+                                    return ""
+                                  endif
+                                  " Increment if an open, decrement if a ')':
+                                  let cnt = cnt + (match[index]=="(" ? 1 : -1)  " ')'
+                                  let match = strpart(match, index+1)
+                                endwhile
+                                let start = start - 2
+                                let len = len - start - strlen(match)
+                              endif
+                              if a:0 == 1
+                                return len
+                              elseif a:0 == 2
+                                return "let " .. a:1 .. "=" .. start .. "| let " .. a:2 .. "=" .. len
+                              else
+                                return strpart(a:string, start, len)
+                              endif
+                            endfun
+                            
+                            " Count the number of disjoint copies of pattern in string.
+                            " If the pattern is a literal string and contains no '0' or '1' characters
+                            " then s:Count(string, pattern, '0', '1') should be faster than
+                            " s:Count(string, pattern).
+    1              0.000001 fun! s:Count(string, pattern, ...)
+                              let pat = escape(a:pattern, '\\')
+                              if a:0 > 1
+                                let foo = substitute(a:string, '[^' .. a:pattern .. ']', "a:1", "g")
+                                let foo = substitute(a:string, pat, a:2, "g")
+                                let foo = substitute(foo, '[^' .. a:2 .. ']', "", "g")
+                                return strlen(foo)
+                              endif
+                              let result = 0
+                              let foo = a:string
+                              let index = matchend(foo, pat)
+                              while index != -1
+                                let result = result + 1
+                                let foo = strpart(foo, index)
+                                let index = matchend(foo, pat)
+                              endwhile
+                              return result
+                            endfun
+                            
+                            " s:Resolve('\(a\)\(b\)', '\(c\)\2\1\1\2') should return table.word, where
+                            " word = '\(c\)\(b\)\(a\)\3\2' and table = '-32-------'.  That is, the first
+                            " '\1' in target is replaced by '\(a\)' in word, table[1] = 3, and this
+                            " indicates that all other instances of '\1' in target are to be replaced
+                            " by '\3'.  The hard part is dealing with nesting...
+                            " Note that ":" is an illegal character for source and target,
+                            " unless it is preceded by "\".
+    1              0.000001 fun! s:Resolve(source, target, output)
+                              let word = a:target
+                              let i = matchend(word, s:notslash .. '\\\d') - 1
+                              let table = "----------"
+                              while i != -2 " There are back references to be replaced.
+                                let d = word[i]
+                                let backref = s:Ref(a:source, d)
+                                " The idea is to replace '\d' with backref.  Before we do this,
+                                " replace any \(\) groups in backref with :1, :2, ... if they
+                                " correspond to the first, second, ... group already inserted
+                                " into backref.  Later, replace :1 with \1 and so on.  The group
+                                " number w+b within backref corresponds to the group number
+                                " s within a:source.
+                                " w = number of '\(' in word before the current one
+                                let w = s:Count(
+                                \ substitute(strpart(word, 0, i-1), '\\\\', '', 'g'), '\(', '1')
+                                let b = 1 " number of the current '\(' in backref
+                                let s = d " number of the current '\(' in a:source
+                                while b <= s:Count(substitute(backref, '\\\\', '', 'g'), '\(', '1')
+                                \ && s < 10
+                                  if table[s] == "-"
+                                    if w + b < 10
+                                      " let table[s] = w + b
+                                      let table = strpart(table, 0, s) .. (w+b) .. strpart(table, s+1)
+                                    endif
+                                    let b = b + 1
+                                    let s = s + 1
+                                  else
+                                    execute s:Ref(backref, b, "start", "len")
+                                    let ref = strpart(backref, start, len)
+                                    let backref = strpart(backref, 0, start) .. ":" .. table[s]
+                                    \ .. strpart(backref, start+len)
+                                    let s = s + s:Count(substitute(ref, '\\\\', '', 'g'), '\(', '1')
+                                  endif
+                                endwhile
+                                let word = strpart(word, 0, i-1) .. backref .. strpart(word, i+1)
+                                let i = matchend(word, s:notslash .. '\\\d') - 1
+                              endwhile
+                              let word = substitute(word, s:notslash .. '\zs:', '\\', 'g')
+                              if a:output == "table"
+                                return table
+                              elseif a:output == "word"
+                                return word
+                              else
+                                return table .. word
+                              endif
+                            endfun
+                            
+                            " Assume a:comma = ",".  Then the format for a:patterns and a:1 is
+                            "   a:patterns = "<pat1>,<pat2>,..."
+                            "   a:1 = "<alt1>,<alt2>,..."
+                            " If <patn> is the first pattern that matches a:string then return <patn>
+                            " if no optional arguments are given; return <patn>,<altn> if a:1 is given.
+    1              0.000002 fun! s:Choose(patterns, string, comma, branch, prefix, suffix, ...)
+                              let tail = (a:patterns =~ a:comma .. "$" ? a:patterns : a:patterns .. a:comma)
+                              let i = matchend(tail, s:notslash .. a:comma)
+                              if a:0
+                                let alttail = (a:1 =~ a:comma .. "$" ? a:1 : a:1 .. a:comma)
+                                let j = matchend(alttail, s:notslash .. a:comma)
+                              endif
+                              let current = strpart(tail, 0, i-1)
+                              if a:branch == ""
+                                let currpat = current
+                              else
+                                let currpat = substitute(current, s:notslash .. a:branch, '\\|', 'g')
+                              endif
+                              " un-escape \, to ,
+                              let currpat = substitute(currpat, '\\,', ',', 'g')
+                              while a:string !~ a:prefix .. currpat .. a:suffix
+                                let tail = strpart(tail, i)
+                                let i = matchend(tail, s:notslash .. a:comma)
+                                if i == -1
+                                  return -1
+                                endif
+                                let current = strpart(tail, 0, i-1)
+                                if a:branch == ""
+                                  let currpat = current
+                                else
+                                  let currpat = substitute(current, s:notslash .. a:branch, '\\|', 'g')
+                                endif
+                                if a:0
+                                  let alttail = strpart(alttail, j)
+                                  let j = matchend(alttail, s:notslash .. a:comma)
+                                endif
+                              endwhile
+                              if a:0
+                                let current = current .. a:comma .. strpart(alttail, 0, j-1)
+                              endif
+                              return current
+                            endfun
+                            
+    1              0.000001 fun! matchit#Match_debug()
+                              let b:match_debug = 1 " Save debugging information.
+                              " pat = all of b:match_words with backrefs parsed
+                              amenu &Matchit.&pat   :echo b:match_pat<CR>
+                              " match = bit of text that is recognized as a match
+                              amenu &Matchit.&match :echo b:match_match<CR>
+                              " curcol = cursor column of the start of the matching text
+                              amenu &Matchit.&curcol        :echo b:match_col<CR>
+                              " wholeBR = matching group, original version
+                              amenu &Matchit.wh&oleBR       :echo b:match_wholeBR<CR>
+                              " iniBR = 'if' piece, original version
+                              amenu &Matchit.ini&BR :echo b:match_iniBR<CR>
+                              " ini = 'if' piece, with all backrefs resolved from match
+                              amenu &Matchit.&ini   :echo b:match_ini<CR>
+                              " tail = 'else\|endif' piece, with all backrefs resolved from match
+                              amenu &Matchit.&tail  :echo b:match_tail<CR>
+                              " fin = 'endif' piece, with all backrefs resolved from match
+                              amenu &Matchit.&word  :echo b:match_word<CR>
+                              " '\'.d in ini refers to the same thing as '\'.table[d] in word.
+                              amenu &Matchit.t&able :echo '0:' .. b:match_table .. ':9'<CR>
+                            endfun
+                            
+                            " Jump to the nearest unmatched "(" or "if" or "<tag>" if a:spflag == "bW"
+                            " or the nearest unmatched "</tag>" or "endif" or ")" if a:spflag == "W".
+                            " Return a "mark" for the original position, so that
+                            "   let m = MultiMatch("bW", "n") ... call winrestview(m)
+                            " will return to the original position.  If there is a problem, do not
+                            " move the cursor and return {}, unless a count is given, in which case
+                            " go up or down as many levels as possible and again return {}.
+                            " TODO This relies on the same patterns as % matching.  It might be a good
+                            " idea to give it its own matching patterns.
+    1              0.000001 fun! matchit#MultiMatch(spflag, mode)
+                              let restore_options = s:RestoreOptions()
+                              let startpos = [line("."), col(".")]
+                              " save v:count1 variable, might be reset from the restore_cursor command
+                              let level = v:count1
+                              if a:mode == "o" && mode(1) !~# '[vV]'
+                                exe "norm! v"
+                              endif
+                            
+                              " First step:  if not already done, set the script variables
+                              "   s:do_BR   flag for whether there are backrefs
+                              "   s:pat     parsed version of b:match_words
+                              "   s:all     regexp based on s:pat and the default groups
+                              " This part is copied and slightly modified from matchit#Match_wrapper().
+                              if !exists("b:match_words") || b:match_words == ""
+                                let match_words = ""
+                                " Allow b:match_words = "GetVimMatchWords()" .
+                              elseif b:match_words =~ ":"
+                                let match_words = b:match_words
+                              else
+                                execute "let match_words =" b:match_words
+                              endif
+                              if (match_words != s:last_words) || (&mps != s:last_mps) ||
+                                \ exists("b:match_debug")
+                                let default = escape(&mps, '[$^.*~\\/?]') .. (strlen(&mps) ? "," : "") ..
+                                  \ '\/\*:\*\/,#\s*if\%(n\=def\)\=:#\s*else\>:#\s*elif\>:#\s*endif\>'
+                                let s:last_mps = &mps
+                                let match_words = match_words .. (strlen(match_words) ? "," : "") .. default
+                                let s:last_words = match_words
+                                if match_words !~ s:notslash .. '\\\d'
+                                  let s:do_BR = 0
+                                  let s:pat = match_words
+                                else
+                                  let s:do_BR = 1
+                                  let s:pat = s:ParseWords(match_words)
+                                endif
+                                let s:all = '\%(' .. substitute(s:pat, '[,:]\+', '\\|', 'g') .. '\)'
+                                if exists("b:match_debug")
+                                  let b:match_pat = s:pat
+                                endif
+                                " Reconstruct the version with unresolved backrefs.
+                                let s:patBR = substitute(match_words .. ',',
+                                  \ s:notslash .. '\zs[,:]*,[,:]*', ',', 'g')
+                                let s:patBR = substitute(s:patBR, s:notslash .. '\zs:\{2,}', ':', 'g')
+                              endif
+                            
+                              " Second step:  figure out the patterns for searchpair()
+                              " and save the screen, cursor position, and 'ignorecase'.
+                              " - TODO:  A lot of this is copied from matchit#Match_wrapper().
+                              " - maybe even more functionality should be split off
+                              " - into separate functions!
+                              let openlist = split(s:pat .. ',', s:notslash .. '\zs:.\{-}' .. s:notslash .. ',')
+                              let midclolist = split(',' .. s:pat, s:notslash .. '\zs,.\{-}' .. s:notslash .. ':')
+                              call map(midclolist, {-> split(v:val, s:notslash .. ':')})
+                              let closelist = []
+                              let middlelist = []
+                              call map(midclolist, {i,v -> [extend(closelist, v[-1 : -1]),
+                                    \ extend(middlelist, v[0 : -2])]})
+                              call map(openlist,   {i,v -> v =~# s:notslash .. '\\|' ? '\%(' .. v .. '\)' : v})
+                              call map(middlelist, {i,v -> v =~# s:notslash .. '\\|' ? '\%(' .. v .. '\)' : v})
+                              call map(closelist,  {i,v -> v =~# s:notslash .. '\\|' ? '\%(' .. v .. '\)' : v})
+                              let open   = join(openlist, ',')
+                              let middle = join(middlelist, ',')
+                              let close  = join(closelist, ',')
+                              if exists("b:match_skip")
+                                let skip = b:match_skip
+                              elseif exists("b:match_comment") " backwards compatibility and testing!
+                                let skip = "r:" .. b:match_comment
+                              else
+                                let skip = 's:comment\|string'
+                              endif
+                              let skip = s:ParseSkip(skip)
+                              let view = winsaveview()
+                            
+                              " Third step: call searchpair().
+                              " Replace '\('--but not '\\('--with '\%(' and ',' with '\|'.
+                              let openpat = substitute(open, '\%(' .. s:notslash .. '\)\@<=\\(', '\\%(', 'g')
+                              let openpat = substitute(openpat, ',', '\\|', 'g')
+                              let closepat = substitute(close, '\%(' .. s:notslash .. '\)\@<=\\(', '\\%(', 'g')
+                              let closepat = substitute(closepat, ',', '\\|', 'g')
+                              let middlepat = substitute(middle, '\%(' .. s:notslash .. '\)\@<=\\(', '\\%(', 'g')
+                              let middlepat = substitute(middlepat, ',', '\\|', 'g')
+                            
+                              if skip =~ 'synID' && !(has("syntax") && exists("g:syntax_on"))
+                                    \ || skip =~ 'v:lua.vim.treesitter' && !exists('b:ts_highlight')
+                                let skip = '0'
+                              else
+                                try
+                                  execute "if " .. skip .. "| let skip = '0' | endif"
+                                catch /^Vim\%((\a\+)\)\=:E363/
+                                  " We won't find anything, so skip searching, should keep Vim responsive.
+                                  return {}
+                                endtry
+                              endif
+                              mark '
+                              while level
+                                if searchpair(openpat, middlepat, closepat, a:spflag, skip) < 1
+                                  call s:CleanUp(restore_options, a:mode, startpos)
+                                  return {}
+                                endif
+                                let level = level - 1
+                              endwhile
+                            
+                              " Restore options and return a string to restore the original position.
+                              call s:CleanUp(restore_options, a:mode, startpos)
+                              return view
+                            endfun
+                            
+                            " Search backwards for "if" or "while" or "<tag>" or ...
+                            " and return "endif" or "endwhile" or "</tag>" or ... .
+                            " For now, this uses b:match_words and the same script variables
+                            " as matchit#Match_wrapper() .  Later, it may get its own patterns,
+                            " either from a buffer variable or passed as arguments.
+                            " fun! s:Autocomplete()
+                            "   echo "autocomplete not yet implemented :-("
+                            "   if !exists("b:match_words") || b:match_words == ""
+                            "     return ""
+                            "   end
+                            "   let startpos = matchit#MultiMatch("bW")
+                            "
+                            "   if startpos == ""
+                            "     return ""
+                            "   endif
+                            "   " - TODO:  figure out whether 'if' or '<tag>' matched, and construct
+                            "   " - the appropriate closing.
+                            "   let matchline = getline(".")
+                            "   let curcol = col(".") - 1
+                            "   " - TODO:  Change the s:all argument if there is a new set of match pats.
+                            "   let regexp = s:Wholematch(matchline, s:all, curcol)
+                            "   let suf = strlen(matchline) - matchend(matchline, regexp)
+                            "   let prefix = (curcol ? '^.\{'  . curcol . '}\%(' : '^\%(')
+                            "   let suffix = (suf ? '\).\{' . suf . '}$'  : '\)$')
+                            "   " Reconstruct the version with unresolved backrefs.
+                            "   let patBR = substitute(b:match_words.',', '[,:]*,[,:]*', ',', 'g')
+                            "   let patBR = substitute(patBR, ':\{2,}', ':', "g")
+                            "   " Now, set group and groupBR to the matching group: 'if:endif' or
+                            "   " 'while:endwhile' or whatever.
+                            "   let group = s:Choose(s:pat, matchline, ",", ":", prefix, suffix, patBR)
+                            "   let i = matchend(group, s:notslash . ",")
+                            "   let groupBR = strpart(group, i)
+                            "   let group = strpart(group, 0, i-1)
+                            "   " Now, matchline =~ prefix . substitute(group,':','\|','g') . suffix
+                            "   if s:do_BR
+                            "     let group = s:InsertRefs(groupBR, prefix, group, suffix, matchline)
+                            "   endif
+                            " " let g:group = group
+                            "
+                            "   " - TODO:  Construct the closing from group.
+                            "   let fake = "end" . expand("<cword>")
+                            "   execute startpos
+                            "   return fake
+                            " endfun
+                            
+                            " Close all open structures.  "Get the heck out of here!"
+                            " fun! s:Gthhoh()
+                            "   let close = s:Autocomplete()
+                            "   while strlen(close)
+                            "     put=close
+                            "     let close = s:Autocomplete()
+                            "   endwhile
+                            " endfun
+                            
+                            " Parse special strings as typical skip arguments for searchpair():
+                            "   s:foo becomes (current syntax item) =~ foo
+                            "   S:foo becomes (current syntax item) !~ foo
+                            "   r:foo becomes (line before cursor) =~ foo
+                            "   R:foo becomes (line before cursor) !~ foo
+                            "   t:foo becomes (current treesitter captures) =~ foo
+                            "   T:foo becomes (current treesitter captures) !~ foo
+    1              0.000001 fun! s:ParseSkip(str)
+                              let skip = a:str
+                              if skip[1] == ":"
+                                if skip[0] ==# "t" || skip[0] ==# "s" && &syntax != 'on' && exists("b:ts_highlight")
+                                  let skip = "match(v:lua.vim.treesitter.get_captures_at_cursor(), '" .. strpart(skip,2) .. "') != -1"
+                                elseif skip[0] ==# "T" || skip[0] ==# "S" && &syntax != 'on' && exists("b:ts_highlight")
+                                  let skip = "match(v:lua.vim.treesitter.get_captures_at_cursor(), '" .. strpart(skip,2) .. "') == -1"
+                                elseif skip[0] ==# "s"
+                                  let skip = "synIDattr(synID(line('.'),col('.'),1),'name') =~? '" ..
+                                    \ strpart(skip,2) .. "'"
+                                elseif skip[0] ==# "S"
+                                  let skip = "synIDattr(synID(line('.'),col('.'),1),'name') !~? '" ..
+                                    \ strpart(skip,2) .. "'"
+                                elseif skip[0] ==# "r"
+                                  let skip = "strpart(getline('.'),0,col('.'))=~'" .. strpart(skip,2) .. "'"
+                                elseif skip[0] ==# "R"
+                                  let skip = "strpart(getline('.'),0,col('.'))!~'" .. strpart(skip,2) .. "'"
+                                endif
+                              endif
+                              return skip
+                            endfun
+                            
+    1   0.000024   0.000004 let &cpo = s:save_cpo
+    1              0.000002 unlet s:save_cpo
+                            
+                            " vim:sts=2:sw=2:et:
+
+SCRIPT  C:\Users\User\AppData\Local\nvim-data\lazy\telescope.nvim\ftplugin\TelescopePrompt.lua
+Sourced 1 time
+Total time:   0.000373
+ Self time:   0.000373
+
+count  total (s)   self (s)
+                            -- Don't wrap textwidth things
+                            vim.opt_local.formatoptions:remove "t"
+                            vim.opt_local.formatoptions:remove "c"
+                            
+                            -- Don't include `showbreak` when calculating strdisplaywidth
+                            vim.opt_local.wrap = false
+                            
+                            -- There's also no reason to enable textwidth here anyway
+                            vim.opt_local.textwidth = 0
+                            vim.opt_local.scrollbind = false
+                            
+                            vim.opt_local.signcolumn = "no"
+
+SCRIPT  C:\Users\User\AppData\Local\nvim-data\lazy\telescope.nvim\ftplugin\TelescopeResults.lua
+Sourced 1 time
+Total time:   0.000325
+ Self time:   0.000325
+
+count  total (s)   self (s)
+                            -- Don't have scrolloff, it makes things weird.
+                            vim.opt_local.scrolloff = 0
+                            vim.opt_local.scrollbind = false
+                            
+                            vim.opt_local.signcolumn = "no"
+
+SCRIPT  C:/Users/User/AppData/Local/nvim-data/lazy/conform.nvim/plugin/conform.lua
+Sourced 1 time
+Total time:   0.000309
+ Self time:   0.000309
+
+count  total (s)   self (s)
+                            vim.api.nvim_create_user_command("ConformInfo", function()
+                              require("conform.health").show_window()
+                            end, { desc = "Show information about Conform formatters" })
+
+FUNCTION  <SNR>23_Slash()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:29
+Called 3 times
+Total time:   0.000011
+ Self time:   0.000011
+
+count  total (s)   self (s)
+    3              0.000009     return tr(a:path, '\', '/')
+
+FUNCTION  <SNR>57_InsertRefs()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:291
+Called 8 times
+Total time:   0.002126
+ Self time:   0.001618
+
+count  total (s)   self (s)
+    8              0.000071   if a:matchline !~ a:prefix .. substitute(a:group, s:notslash .. '\zs:', '\\|', 'g') .. a:suffix
+                                return a:group
+    8              0.000003   endif
+    8              0.000029   let i = matchend(a:groupBR, s:notslash .. ':')
+    8              0.000012   let ini = strpart(a:groupBR, 0, i-1)
+    8              0.000011   let tailBR = strpart(a:groupBR, i)
+    8   0.000444   0.000044   let word = s:Choose(a:group, a:matchline, ":", "", a:prefix, a:suffix, a:groupBR)
+    8              0.000028   let i = matchend(word, s:notslash .. ":")
+    8              0.000011   let wordBR = strpart(word, i)
+    8              0.000011   let word = strpart(word, 0, i-1)
+                              " Now, a:matchline =~ a:prefix . word . a:suffix
+    8              0.000007   if wordBR != ini
+    3   0.000119   0.000011     let table = s:Resolve(ini, wordBR, "table")
+    5              0.000002   else
+    5              0.000003     let table = ""
+    5              0.000003     let d = 0
+   55              0.000049     while d < 10
+   50              0.000151       if tailBR =~ s:notslash .. '\\' .. d
+                                    let table = table .. d
+   50              0.000015       else
+   50              0.000047         let table = table .. "-"
+   50              0.000015       endif
+   50              0.000032       let d = d + 1
+   55              0.000019     endwhile
+    8              0.000002   endif
+    8              0.000005   let d = 9
+   80              0.000035   while d
+   72              0.000183     if table[d] != "-"
+                                  let backref = substitute(a:matchline, a:prefix .. word .. a:suffix, '\' .. table[d], "")
+                                    " Are there any other characters that should be escaped?
+                                  let backref = escape(backref, '*,:')
+                                  execute s:Ref(ini, d, "start", "len")
+                                  let ini = strpart(ini, 0, start) .. backref .. strpart(ini, start+len)
+                                  let tailBR = substitute(tailBR, s:notslash .. '\zs\\' .. d, escape(backref, '\\&'), 'g')
+   72              0.000020     endif
+   72              0.000045     let d = d-1
+   80              0.000031   endwhile
+    8              0.000013   if exists("b:match_debug")
+                                if s:do_BR
+                                  let b:match_table = table
+                                  let b:match_word = word
+                                else
+                                  let b:match_table = ""
+                                  let b:match_word = ""
+                                endif
+    8              0.000002   endif
+    8              0.000010   return ini .. ":" .. tailBR
+
+FUNCTION  provider#clipboard#Call()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\autoload\provider\clipboard.vim:344
+Called 1 time
+Total time:   0.029152
+ Self time:   0.000044
+
+count  total (s)   self (s)
+    1              0.000010   if get(s:, 'here', v:false)  " Clipboard provider must not recurse. #7184
+                                return 0
+    1              0.000002   endif
+    1              0.000004   let s:here = v:true
+    1              0.000001   try
+    1   0.029125   0.000017     return call(s:clipboard[a:method],a:args,s:clipboard)
+    1              0.000002   finally
+    1              0.000002     let s:here = v:false
+    1              0.000001   endtry
+
+FUNCTION  <SNR>47_AlreadyInitialized()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:76
+Called 28 times
+Total time:   0.000456
+ Self time:   0.000216
+
+count  total (s)   self (s)
+   28   0.000440   0.000200   return copilot#util#Defer(function(a:fn, [self] + a:000))
+
+FUNCTION  <SNR>47_NvimIsAttached()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:447
+Called 8 times
+Total time:   0.000135
+ Self time:   0.000135
+
+count  total (s)   self (s)
+    8              0.000131   return bufloaded(a:bufnr) ? luaeval('vim.lsp.buf_is_attached(_A[1], _A[2])', [a:bufnr, self.id]) : v:false
+
+FUNCTION  <SNR>47_NvimDoNotify()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:487
+Called 3 times
+Total time:   0.000088
+ Self time:   0.000088
+
+count  total (s)   self (s)
+    3              0.000086   return eval("v:lua.require'_copilot'.rpc_notify(a:client.id, a:method, a:params)")
+
+FUNCTION  copilot#logger#Debug()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\logger.vim:42
+Called 25 times
+Total time:   0.000081
+ Self time:   0.000081
+
+count  total (s)   self (s)
+   25              0.000048   if empty(get(g:, 'copilot_debug'))
+   25              0.000012     return
+                              endif
+                              call copilot#logger#Raw(4, a:000)
+
+FUNCTION  <SNR>47_NvimNotify()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:483
+Called 3 times
+Total time:   0.000063
+ Self time:   0.000023
+
+count  total (s)   self (s)
+    3   0.000062   0.000021   call self.AfterInitialized(function('s:NvimDoNotify'), a:method, a:params)
+
+FUNCTION  <SNR>42_Attach()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:423
+Called 1 time
+Total time:   0.002378
+ Self time:   0.000015
+
+count  total (s)   self (s)
+    1              0.000001   try
+    1   0.002372   0.000010     return copilot#Client().Attach(a:bufnr)
+                              catch
+                                call copilot#logger#Exception()
+    1              0.000001   endtry
+
+FUNCTION  <SNR>47_Cancel()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:289
+Called 25 times
+Total time:   0.000229
+ Self time:   0.000229
+
+count  total (s)   self (s)
+   25              0.000077   if has_key(self.requests, get(a:request, 'id', ''))
+                                call self.Notify('$/cancelRequest', {'id': a:request.id})
+                                call s:RejectRequest(remove(self.requests, a:request.id), s:error_canceled)
+   25              0.000010   endif
+
+FUNCTION  <SNR>57_ParseSkip()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:767
+Called 8 times
+Total time:   0.000170
+ Self time:   0.000170
+
+count  total (s)   self (s)
+    8              0.000007   let skip = a:str
+    8              0.000008   if skip[1] == ":"
+    8              0.000031     if skip[0] ==# "t" || skip[0] ==# "s" && &syntax != 'on' && exists("b:ts_highlight")
+    8              0.000020       let skip = "match(v:lua.vim.treesitter.get_captures_at_cursor(), '" .. strpart(skip,2) .. "') != -1"
+                                elseif skip[0] ==# "T" || skip[0] ==# "S" && &syntax != 'on' && exists("b:ts_highlight")
+                                  let skip = "match(v:lua.vim.treesitter.get_captures_at_cursor(), '" .. strpart(skip,2) .. "') == -1"
+                                elseif skip[0] ==# "s"
+                                  let skip = "synIDattr(synID(line('.'),col('.'),1),'name') =~? '" .. strpart(skip,2) .. "'"
+                                elseif skip[0] ==# "S"
+                                  let skip = "synIDattr(synID(line('.'),col('.'),1),'name') !~? '" .. strpart(skip,2) .. "'"
+                                elseif skip[0] ==# "r"
+                                  let skip = "strpart(getline('.'),0,col('.'))=~'" .. strpart(skip,2) .. "'"
+                                elseif skip[0] ==# "R"
+                                  let skip = "strpart(getline('.'),0,col('.'))!~'" .. strpart(skip,2) .. "'"
+    8              0.000003     endif
+    8              0.000002   endif
+    8              0.000005   return skip
+
+FUNCTION  <SNR>47_Callback()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:807
+Called 25 times
+Total time:   0.004243
+ Self time:   0.000267
+
+count  total (s)   self (s)
+   25              0.000064   call remove(a:request.waiting, a:timer)
+   25              0.000037   if has_key(a:request, a:type)
+   25   0.004105   0.000130     call a:callback(a:request[a:type])
+   25              0.000006   endif
+
+FUNCTION  <SNR>57_ParseWords()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:349
+Called 8 times
+Total time:   0.008212
+ Self time:   0.003673
+
+count  total (s)   self (s)
+    8              0.000357   let groups = substitute(a:groups .. ",", s:notslash .. '\zs[,:]*,[,:]*', ',', 'g')
+    8              0.000192   let groups = substitute(groups, s:notslash .. '\zs:\{2,}', ':', 'g')
+    8              0.000006   let parsed = ""
+   72              0.000168   while groups =~ '[^,:]'
+   64              0.000305     let i = matchend(groups, s:notslash .. ':')
+   64              0.000341     let j = matchend(groups, s:notslash .. ',')
+   64              0.000110     let ini = strpart(groups, 0, i-1)
+   64              0.000112     let tail = strpart(groups, i, j-i-1) .. ":"
+   64              0.000085     let groups = strpart(groups, j)
+   64              0.000072     let parsed = parsed .. ini
+   64              0.000247     let i = matchend(tail, s:notslash .. ':')
+  152              0.000090     while i != -1
+                                  " In 'if:else:endif', ini='if' and word='else' and then word='endif'.
+   88              0.000130       let word = strpart(tail, 0, i-1)
+   88              0.000103       let tail = strpart(tail, i)
+   88              0.000283       let i = matchend(tail, s:notslash .. ':')
+   88   0.004972   0.000433       let parsed = parsed .. ":" .. s:Resolve(ini, word, "word")
+  152              0.000058     endwhile " Now, tail has been used up.
+   64              0.000068     let parsed = parsed .. ","
+   72              0.000026   endwhile " groups =~ '[^,:]'
+    8              0.000034   let parsed = substitute(parsed, ',$', '', '')
+    8              0.000006   return parsed
+
+FUNCTION  <SNR>43_RunDeferred()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\util.vim:12
+Called 74 times
+Total time:   0.009910
+ Self time:   0.000797
+
+count  total (s)   self (s)
+   74              0.000192   if empty(s:deferred)
+   37              0.000027     return
+   37              0.000013   endif
+   37              0.000115   let Fn = remove(s:deferred, 0)
+   37              0.000154   call timer_start(0, function('s:RunDeferred'))
+   37   0.009303   0.000190   call call(Fn, [])
+
+FUNCTION  copilot#Client()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:48
+Called 40 times
+Total time:   0.000576
+ Self time:   0.000196
+
+count  total (s)   self (s)
+   40   0.000526   0.000145   call s:Start()
+   40              0.000029   return s:client
+
+FUNCTION  copilot#OnInsertEnter()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:453
+Called 4 times
+Total time:   0.000980
+ Self time:   0.000021
+
+count  total (s)   self (s)
+    4   0.000978   0.000018   return copilot#Schedule()
+
+FUNCTION  <SNR>47_StatusNotification()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:649
+Called 25 times
+Total time:   0.000088
+ Self time:   0.000088
+
+count  total (s)   self (s)
+   25              0.000069   let a:instance.status = a:params
+
+FUNCTION  copilot#Suggest()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:391
+Called 25 times
+Total time:   0.013665
+ Self time:   0.000687
+
+count  total (s)   self (s)
+   25   0.000345   0.000173   if !s:Running()
+                                return ''
+   25              0.000010   endif
+   25              0.000021   try
+   25   0.013112   0.000306     call copilot#Complete(function('s:HandleTriggerResult'), function('s:HandleTriggerError'))
+                              catch
+                                call copilot#logger#Exception()
+   25              0.000028   endtry
+   25              0.000015   return ''
+
+FUNCTION  <SNR>47_NvimAttach()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:439
+Called 29 times
+Total time:   0.004214
+ Self time:   0.002121
+
+count  total (s)   self (s)
+   29              0.000049   if !bufloaded(a:bufnr)
+                                return {'uri': '', 'version': 0}
+   29              0.000010   endif
+   29   0.003053   0.000960   call luaeval('pcall(vim.lsp.buf_attach_client, _A[1], _A[2])', [a:bufnr, self.id])
+   29              0.001026   return luaeval('{uri = vim.uri_from_bufnr(_A), version = vim.lsp.util.buf_versions[_A]}', a:bufnr)
+
+FUNCTION  <SNR>23_AutoInit()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:632
+Called 2 times
+Total time:   0.007378
+ Self time:   0.000014
+
+count  total (s)   self (s)
+    2   0.007377   0.000012   return s:Init(1, 1, 1, 1)
+
+FUNCTION  <SNR>57_RestoreOptions()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:34
+Called 8 times
+Total time:   0.000617
+ Self time:   0.000249
+
+count  total (s)   self (s)
+                              " In s:CleanUp(), :execute "set" restore_options .
+    8              0.000015   let restore_options = ""
+    8              0.000043   if get(b:, 'match_ignorecase', &ic) != &ic
+    8              0.000025     let restore_options ..= (&ic ? " " : " no") .. "ignorecase"
+    8   0.000257   0.000036     let &ignorecase = b:match_ignorecase
+    8              0.000007   endif
+    8              0.000012   if &ve != ''
+                                let restore_options = " ve=" .. &ve .. restore_options
+                                set ve=
+    8              0.000003   endif
+    8              0.000008   if &smartcase
+    8              0.000013     let restore_options = " smartcase " .. restore_options
+    8   0.000169   0.000022     set nosmartcase
+    8              0.000003   endif
+    8              0.000012   return restore_options
+
+FUNCTION  <SNR>57_Count()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:450
+Called 24 times
+Total time:   0.000443
+ Self time:   0.000443
+
+count  total (s)   self (s)
+   24              0.000038   let pat = escape(a:pattern, '\\')
+   24              0.000015   if a:0 > 1
+                                let foo = substitute(a:string, '[^' .. a:pattern .. ']', "a:1", "g")
+                                let foo = substitute(a:string, pat, a:2, "g")
+                                let foo = substitute(foo, '[^' .. a:2 .. ']', "", "g")
+                                return strlen(foo)
+   24              0.000007   endif
+   24              0.000016   let result = 0
+   24              0.000017   let foo = a:string
+   24              0.000047   let index = matchend(foo, pat)
+   40              0.000028   while index != -1
+   16              0.000013     let result = result + 1
+   16              0.000020     let foo = strpart(foo, index)
+   16              0.000029     let index = matchend(foo, pat)
+   40              0.000016   endwhile
+   24              0.000014   return result
+
+FUNCTION  <SNR>47_RegisterWorkspaceFolderForBuffer()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:207
+Called 25 times
+Total time:   0.001107
+ Self time:   0.000465
+
+count  total (s)   self (s)
+   25              0.000060   let root = getbufvar(a:buf, 'workspace_folder')
+   25              0.000036   if type(root) != v:t_string
+                                return
+   25              0.000009   endif
+   25   0.000873   0.000231   let root = s:UriFromPath(substitute(root, '[\/]$', '', ''))
+   25              0.000055   if empty(root) || has_key(a:instance.workspaceFolders, root)
+   25              0.000013     return
+                              endif
+                              let a:instance.workspaceFolders[root] = v:true
+                              call a:instance.Notify('workspace/didChangeWorkspaceFolders', {'event': {'added': [{'uri': root, 'name': fnamemodify(root, ':t')}], 'removed': []}})
+
+FUNCTION  <SNR>23_Warn()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:19
+Called 1 time
+Total time:   0.000004
+ Self time:   0.000004
+
+count  total (s)   self (s)
+    1              0.000001   if !get(a:000, 0, 0)
+                                echohl WarningMsg
+                                echo a:msg
+                                echohl NONE
+    1              0.000000   endif
+    1              0.000000   return ''
+
+FUNCTION  copilot#OnFileType()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:431
+Called 17 times
+Total time:   0.001034
+ Self time:   0.000179
+
+count  total (s)   self (s)
+   17   0.000962   0.000117   if empty(s:BufferDisabled()) && &l:modifiable && &l:buflisted
+    1   0.000017   0.000007     call copilot#util#Defer(function('s:Attach'), bufnr(''))
+   17              0.000006   endif
+
+FUNCTION  <SNR>47_DispatchMessage()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:306
+Called 25 times
+Total time:   0.000731
+ Self time:   0.000643
+
+count  total (s)   self (s)
+   25              0.000021   try
+   25   0.000289   0.000201     let response = {'result': call(a:handler, [a:params, a:instance])}
+   25              0.000037     if response.result is# 0
+   25              0.000027       let response.result = v:null
+   25              0.000010     endif
+                              catch
+                                call copilot#logger#Exception('lsp.request.' . a:method)
+                                let response = {'error': {'code': -32000, 'message': v:exception}}
+   25              0.000015   endtry
+   25              0.000031   if a:id isnot# v:null
+                                call s:Send(a:instance, extend({'id': a:id}, response))
+   25              0.000009   endif
+   25              0.000052   if !has_key(s:notifications, a:method)
+                                return response
+   25              0.000007   endif
+
+FUNCTION  <SNR>47_NvimRequest()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:451
+Called 25 times
+Total time:   0.007738
+ Self time:   0.000815
+
+count  total (s)   self (s)
+   25              0.000125   let params = deepcopy(a:params)
+   25   0.005830   0.000170   let [bufnr, progress] = s:PreprocessParams(self, params)
+   25   0.001120   0.000272   let request = call('s:SetUpRequest', [self, v:null, a:method, params, progress] + a:000)
+   25   0.000605   0.000190   call self.AfterInitialized(function('s:NvimDoRequest'), request, bufnr)
+   25              0.000017   return request
+
+FUNCTION  <SNR>23_Guess()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:38
+Called 2 times
+Total time:   0.005088
+ Self time:   0.005088
+
+count  total (s)   self (s)
+    2              0.000012   let has_heredocs = a:detected.filetype =~# '^\%(perl\|php\|ruby\|[cz]\=sh\|bash\)$'
+    2              0.000002   let options = {}
+    2              0.000005   let heuristics = {'spaces': 0, 'hard': 0, 'soft': 0, 'checked': 0, 'indents': {}}
+    2              0.000006   let tabstop = get(a:detected.options, 'tabstop', get(a:detected.defaults, 'tabstop', [8]))[0]
+    2              0.000004   let softtab = repeat(' ', tabstop)
+    2              0.000001   let waiting_on = ''
+    2              0.000001   let prev_indent = -1
+    2              0.000001   let prev_line = ''
+                            
+  133              0.000060   for line in a:lines
+  132              0.000098     if len(waiting_on)
+                                  if line =~# waiting_on
+                                    let waiting_on = ''
+                                    let prev_indent = -1
+                                    let prev_line = ''
+                                  endif
+                                  continue
+  132              0.000213     elseif line =~# '^\s*$'
+   16              0.000005       continue
+  116              0.000115     elseif a:detected.filetype ==# 'python' && prev_line[-1:-1] =~# '[[\({]'
+                                  let prev_indent = -1
+                                  let prev_line = ''
+                                  continue
+  116              0.000149     elseif line =~# '^=\w' && line !~# '^=\%(end\|cut\)\>'
+                                  let waiting_on = '^=\%(end\|cut\)\>'
+  116              0.000169     elseif line =~# '^@@\+ -\d\+,\d\+ '
+                                  let waiting_on = '^$'
+  116              0.000246     elseif line !~# '[/<"`]'
+                                  " No need to do other checks
+    3              0.000008     elseif line =~# '^\s*/\*' && line !~# '\*/'
+                                  let waiting_on = '\*/'
+    3              0.000006     elseif line =~# '^\s*<\!--' && line !~# '-->'
+                                  let waiting_on = '-->'
+    3              0.000014     elseif line =~# '^[^"]*"""'
+                                  let waiting_on = '^[^"]*"""'
+    3              0.000003     elseif a:detected.filetype ==# 'go' && line =~# '^[^`]*`[^`]*$'
+                                  let waiting_on = '^[^`]*`[^`]*$'
+    3              0.000001     elseif has_heredocs
+                                  let waiting_on = matchstr(line, '<<\s*\([''"]\=\)\zs\w\+\ze\1[^''"`<>]*$')
+                                  if len(waiting_on)
+                                    let waiting_on = '^' . waiting_on . '$'
+                                  endif
+  116              0.000023     endif
+                            
+  116              0.000385     let indent = len(matchstr(substitute(line, '\t', softtab, 'g'), '^ *'))
+  116              0.000111     if line =~# '^\t'
+                                  let heuristics.hard += 1
+  116              0.000221     elseif line =~# '^' . softtab
+   10              0.000007       let heuristics.soft += 1
+  116              0.000025     endif
+  116              0.000136     if line =~# '^  '
+   97              0.000066       let heuristics.spaces += 1
+  116              0.000026     endif
+  116              0.000125     let increment = prev_indent < 0 ? 0 : indent - prev_indent
+  116              0.000072     let prev_indent = indent
+  116              0.000071     let prev_line = line
+  116              0.000098     if increment > 1 && (increment < 4 || increment % 4 == 0)
+   32              0.000037       if has_key(heuristics.indents, increment)
+   31              0.000031         let heuristics.indents[increment] += 1
+    1              0.000000       else
+    1              0.000001         let heuristics.indents[increment] = 1
+   32              0.000007       endif
+   32              0.000020       let heuristics.checked += 1
+  116              0.000024     endif
+  116              0.000190     if heuristics.checked >= 32 && (heuristics.hard > 3 || heuristics.soft > 3) && get(heuristics.indents, increment) * 2 > heuristics.checked
+    1              0.000001       if heuristics.spaces
+    1              0.000000         break
+                                  elseif !exists('no_space_indent')
+                                    let no_space_indent = stridx("\n" . join(a:lines, "\n"), "\n  ") < 0
+                                    if no_space_indent
+                                      break
+                                    endif
+                                  endif
+                                  break
+  115              0.000022     endif
+  117              0.000040   endfor
+                            
+    2              0.000004   let a:detected.heuristics[a:source] = heuristics
+                            
+    2              0.000002   let max_frequency = 0
+    3              0.000005   for [shiftwidth, frequency] in items(heuristics.indents)
+    1              0.000002     if frequency > max_frequency || frequency == max_frequency && +shiftwidth < get(options, 'shiftwidth')
+    1              0.000001       let options.shiftwidth = +shiftwidth
+    1              0.000001       let max_frequency = frequency
+    1              0.000000     endif
+    3              0.000001   endfor
+                            
+    2              0.000003   if heuristics.hard && !heuristics.spaces && !has_key(a:detected.options, 'tabstop')
+                                let options = {'expandtab': 0, 'shiftwidth': 0}
+    2              0.000002   elseif heuristics.hard > heuristics.soft
+                                let options.expandtab = 0
+                                let options.tabstop = tabstop
+    2              0.000000   else
+    2              0.000001     if heuristics.soft
+    1              0.000001       let options.expandtab = 1
+    2              0.000001     endif
+    2              0.000047     if heuristics.hard || has_key(a:detected.options, 'tabstop') || stridx(join(a:lines, "\n"), "\t") >= 0
+                                  let options.tabstop = tabstop
+    2              0.000004     elseif !&g:shiftwidth && has_key(options, 'shiftwidth') && !has_key(a:detected.options, 'shiftwidth')
+                                  let options.tabstop = options.shiftwidth
+                                  let options.shiftwidth = 0
+    2              0.000000     endif
+    2              0.000001   endif
+                            
+    2              0.000005   call map(options, '[v:val, a:source]')
+    2              0.000034   call extend(a:detected.options, options, 'keep')
+
+FUNCTION  <SNR>42_HideDuringCompletion()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:189
+Called 87 times
+Total time:   0.000229
+ Self time:   0.000229
+
+count  total (s)   self (s)
+   87              0.000188   return get(g:, 'copilot_hide_during_completion', 1)
+
+FUNCTION  <SNR>42_Trigger()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:403
+Called 25 times
+Total time:   0.014642
+ Self time:   0.000977
+
+count  total (s)   self (s)
+   25              0.000434   let timer = get(g:, '_copilot_timer', -1)
+   25              0.000177   if a:bufnr !=# bufnr('') || a:timer isnot# timer || mode() !=# 'i'
+                                return
+   25              0.000024   endif
+   25              0.000054   unlet! g:_copilot_timer
+   25   0.013807   0.000142   return copilot#Suggest()
+
+FUNCTION  copilot#client#LspHandle()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:491
+Called 25 times
+Total time:   0.001770
+ Self time:   0.000413
+
+count  total (s)   self (s)
+   25              0.000155   if !has_key(s:instances, a:id)
+                                return
+   25              0.000015   endif
+   25   0.001537   0.000180   return s:OnMessage(s:instances[a:id], a:request)
+
+FUNCTION  <SNR>42_Start()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:34
+Called 40 times
+Total time:   0.000381
+ Self time:   0.000222
+
+count  total (s)   self (s)
+   40   0.000323   0.000164   if s:Running() || exists('s:client.startup_error')
+   40              0.000022     return
+                              endif
+                              let s:client = copilot#client#New()
+
+FUNCTION  <SNR>47_OnMessage()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:324
+Called 25 times
+Total time:   0.001357
+ Self time:   0.000626
+
+count  total (s)   self (s)
+   25              0.000049   if !has_key(a:body, 'method')
+                                return s:OnResponse(a:instance, a:body)
+   25              0.000010   endif
+   25              0.000044   let request = a:body
+   25              0.000054   let id = get(request, 'id', v:null)
+   25              0.000043   let params = get(request, 'params', v:null)
+   25              0.000061   if has_key(a:instance.methods, request.method)
+   25   0.000995   0.000264     return s:DispatchMessage(a:instance, request.method, a:instance.methods[request.method], id, params)
+                              elseif id isnot# v:null
+                                call s:Send(a:instance, {"id": id, "error": {"code": -32700, "message": "Method not found: " . request.method}})
+                                call copilot#logger#Debug('Unexpected request ' . request.method . ' called with ' . json_encode(params))
+                              elseif request.method !~# '^\$/'
+                                call copilot#logger#Debug('Unexpected notification ' . request.method . ' called with ' . json_encode(params))
+                              endif
+
+FUNCTION  <SNR>42_BufferDisabled()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:121
+Called 78 times
+Total time:   0.003640
+ Self time:   0.003640
+
+count  total (s)   self (s)
+   78              0.001084   if &buftype =~# '^\%(help\|prompt\|quickfix\|terminal\)$'
+   13              0.000010     return 5
+   65              0.000040   endif
+   65              0.000135   if exists('b:copilot_disabled')
+                                return empty(b:copilot_disabled) ? 0 : 3
+   65              0.000022   endif
+   65              0.000085   if exists('b:copilot_enabled')
+                                return empty(b:copilot_enabled) ? 4 : 0
+   65              0.000020   endif
+   65              0.000593   let short = empty(&l:filetype) ? '.' : split(&l:filetype, '\.', 1)[0]
+   65              0.000123   let config = {}
+   65              0.000241   if type(get(g:, 'copilot_filetypes')) == v:t_dict
+                                let config = g:copilot_filetypes
+   65              0.000019   endif
+   65              0.000103   if has_key(config, &l:filetype)
+                                return empty(config[&l:filetype])
+   65              0.000095   elseif has_key(config, short)
+                                return empty(config[short])
+   65              0.000064   elseif has_key(config, '*')
+                                return empty(config['*'])
+   65              0.000022   else
+   65              0.000163     return get(s:filetype_defaults, short, 1) == 0 ? 2 : 0
+                              endif
+
+FUNCTION  <SNR>47_PreprocessParams()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:220
+Called 25 times
+Total time:   0.005660
+ Self time:   0.002776
+
+count  total (s)   self (s)
+   25              0.000030   let bufnr = v:null
+   50              0.000242   for doc in filter([get(a:params, 'textDocument', {})], 'type(get(v:val, "uri", "")) == v:t_number')
+   25              0.000029     let bufnr = doc.uri
+   25   0.001288   0.000180     call s:RegisterWorkspaceFolderForBuffer(a:instance, bufnr)
+   25   0.002707   0.000930     call extend(doc, a:instance.Attach(bufnr))
+   50              0.000043   endfor
+   25              0.000033   let progress_tokens = []
+  125              0.000143   for key in keys(a:params)
+  100              0.000310     if key =~# 'Token$' && type(a:params[key]) == v:t_func
+                                  let s:progress_token_id += 1
+                                  let a:instance.progress[s:progress_token_id] = a:params[key]
+                                  call add(progress_tokens, s:progress_token_id)
+                                  let a:params[key] = s:progress_token_id
+  100              0.000033     endif
+  125              0.000049   endfor
+   25              0.000038   return [bufnr, progress_tokens]
+
+FUNCTION  <SNR>23_ModelineOptions()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:182
+Called 2 times
+Total time:   0.000253
+ Self time:   0.000158
+
+count  total (s)   self (s)
+    2              0.000002   let options = {}
+    2              0.000005   if !&l:modeline && (&g:modeline || s:Capture('setlocal') =~# '\\\@<![[:space:]]nomodeline\>' && s:Capture('verbose setglobal modeline?') !=# s:Capture('verbose setlocal modeline?'))
+    1              0.000001     return options
+    1              0.000000   endif
+    1              0.000002   let modelines = get(b:, 'sleuth_modelines', get(g:, 'sleuth_modelines', 5))
+    1              0.000002   if line('$') > 2 * modelines
+    1              0.000005     let lnums = range(1, modelines) + range(line('$') - modelines + 1, line('$'))
+                              else
+                                let lnums = range(1, line('$'))
+    1              0.000000   endif
+   11              0.000005   for lnum in lnums
+   10   0.000210   0.000115     if s:ParseOptions(split(matchstr(getline(lnum), '\%(\S\@<!vim\=\|\s\@<=ex\):\s*\(set\= \zs[^:]\+\|\zs.*\S\)'), '[[:space:]:]\+'), options, 'modeline', lnum)
+                                  break
+   10              0.000002     endif
+   11              0.000006   endfor
+    1              0.000000   return options
+
+FUNCTION  copilot#util#UTF16Width()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\util.vim:21
+Called 25 times
+Total time:   0.000308
+ Self time:   0.000308
+
+count  total (s)   self (s)
+   25              0.000287   return strchars(substitute(a:str, "\\%#=2[^\u0001-\uffff]", "  ", 'g'))
+
+FUNCTION  <SNR>47_RequestCancel()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:296
+Called 25 times
+Total time:   0.000803
+ Self time:   0.000453
+
+count  total (s)   self (s)
+   25   0.000278   0.000157   let instance = self.Client()
+   25              0.000036   if !empty(instance)
+   25   0.000345   0.000116     call instance.Cancel(self)
+                              elseif get(self, 'status', '') ==# 'running'
+                                call s:RejectRequest(self, s:error_canceled)
+   25              0.000009   endif
+   25              0.000018   return self
+
+FUNCTION  <SNR>23_DetectDeclared()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:488
+Called 2 times
+Total time:   0.001585
+ Self time:   0.000314
+
+count  total (s)   self (s)
+    2   0.000024   0.000017   let detected = {'bufname': s:Slash(@%), 'declared': {}}
+    2              0.000016   let absolute_or_empty = detected.bufname =~# '^$\|^\a\+:\|^/'
+    2              0.000009   if &l:buftype =~# '^\%(nowrite\)\=$' && !absolute_or_empty
+                                let detected.bufname = substitute(s:Slash(getcwd()), '/\=$', '/', '') . detected.bufname
+                                let absolute_or_empty = 1
+    2              0.000001   endif
+    2              0.000005   let detected.path = absolute_or_empty ? detected.bufname : ''
+    2              0.000018   let pre = substitute(matchstr(detected.path, '^\a\a\+\ze:'), '^\a', '\u&', 'g')
+    2              0.000004   if len(pre) && exists('*' . pre . 'Real')
+                                let detected.path = s:Slash(call(pre . 'Real', [detected.path]))
+    2              0.000001   endif
+                            
+    2              0.000001   try
+    2              0.000007     if len(detected.path) && exists('*ExcludeBufferFromDiscovery') && !empty(ExcludeBufferFromDiscovery(detected.path, 'sleuth'))
+                                  let detected.path = ''
+    2              0.000001     endif
+                              catch
+    2              0.000001   endtry
+    2   0.001000   0.000117   let [detected.editorconfig, detected.root] = s:DetectEditorConfig(detected.path)
+    2   0.000175   0.000047   call extend(detected.declared, s:EditorConfigToOptions(detected.editorconfig))
+    2   0.000300   0.000047   call extend(detected.declared, s:ModelineOptions())
+    2              0.000001   return detected
+
+FUNCTION  <SNR>47_NvimDoRequest()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:459
+Called 25 times
+Total time:   0.006022
+ Self time:   0.005065
+
+count  total (s)   self (s)
+   25              0.000029   let request = a:request
+   25              0.000061   if has_key(a:client, 'client_id') && !has_key(a:client, 'kill')
+   25   0.005489   0.004531     let request.id = eval("v:lua.require'_copilot'.lsp_request(a:client.id, a:request.method, a:request.params, a:bufnr)")
+   25              0.000028   endif
+   25              0.000052   if request.id isnot# v:null
+   25              0.000081     let a:client.requests[request.id] = request
+                              else
+                                if has_key(a:client, 'client_id')
+                                  call copilot#client#LspExit(a:client.client_id, -1, -1)
+                                endif
+                                call copilot#util#Defer(function('s:RejectRequest'), request, s:error_connection_inactive)
+   25              0.000010   endif
+   25              0.000022   return request
+
+FUNCTION  copilot#client#Error()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:822
+Called 25 times
+Total time:   0.000163
+ Self time:   0.000163
+
+count  total (s)   self (s)
+   25              0.000035   if has_key(a:request, 'reject')
+   25              0.000038     call add(a:request.reject, a:callback)
+                              elseif has_key(a:request, 'error')
+                                let a:request.waiting[timer_start(0, function('s:Callback', [a:request, 'error', a:callback]))] = 1
+   25              0.000008   endif
+
+FUNCTION  copilot#OnCursorMovedI()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:465
+Called 57 times
+Total time:   0.014478
+ Self time:   0.000363
+
+count  total (s)   self (s)
+   57   0.014437   0.000322   return copilot#Schedule()
+
+FUNCTION  <SNR>23_DetectHeuristics()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:513
+Called 2 times
+Total time:   0.005403
+ Self time:   0.000282
+
+count  total (s)   self (s)
+    2              0.000002   let detected = a:into
+    2              0.000007   let filetype = split(&l:filetype, '\.', 1)[0]
+    2              0.000003   if get(detected, 'filetype', '*') ==# filetype
+                                return detected
+    2              0.000000   endif
+    2              0.000002   let detected.filetype = filetype
+    2              0.000003   let options = copy(detected.declared)
+    2              0.000002   let detected.options = options
+    2              0.000002   let detected.heuristics = {}
+    2              0.000002   if has_key(detected, 'patterns')
+                                call remove(detected, 'patterns')
+    2              0.000001   endif
+    2   0.000027   0.000008   let detected.defaults = s:UserOptions(filetype, 'defaults')
+    2              0.000009   if empty(filetype) || !get(b:, 'sleuth_automatic', 1) || empty(get(b:, 'sleuth_heuristics', get(g:, 'sleuth_' . filetype . '_heuristics', get(g:, 'sleuth_heuristics', 1))))
+                                return detected
+    2              0.000000   endif
+    2   0.000011   0.000005   if s:Ready(detected)
+                                return detected
+    2              0.000000   endif
+                            
+    2              0.000043   let lines = getline(1, 1024)
+    2   0.005097   0.000009   call s:Guess(detected.bufname, detected, lines)
+    2   0.000011   0.000007   if s:Ready(detected)
+    1              0.000001     return detected
+    1              0.000003   elseif get(options, 'shiftwidth', [4])[0] < 4 && stridx(join(lines, "\n"), "\t") == -1
+                                let options.expandtab = [1, detected.bufname]
+                                return detected
+    1              0.000000   endif
+    1              0.000002   let dir = len(detected.path) ? fnamemodify(detected.path, ':h') : ''
+    1   0.000111   0.000107   let root = len(detected.root) ? fnamemodify(detected.root, ':h') : dir ==# s:Slash(expand('~')) ? dir : fnamemodify(dir, ':h')
+    1              0.000006   if detected.bufname =~# '^\a\a\+:' || root ==# '.' || !isdirectory(root)
+    1              0.000001     let dir = ''
+    1              0.000000   endif
+    1              0.000003   let c = get(b:, 'sleuth_neighbor_limit', get(g:, 'sleuth_neighbor_limit', 8))
+    1              0.000001   if c <= 0 || empty(dir)
+    1              0.000001     let detected.patterns = []
+                              elseif type(get(b:, 'sleuth_globs')) == type([])
+                                let detected.patterns = b:sleuth_globs
+                              elseif type(get(g:, 'sleuth_' . detected.filetype . '_globs')) == type([])
+                                let detected.patterns = get(g:, 'sleuth_' . detected.filetype . '_globs')
+                              else
+                                let detected.patterns = ['*' . matchstr(detected.bufname, '/\@<!\.[^][{}*?$~\`./]\+$')]
+                                if detected.patterns ==# ['*']
+                                  let detected.patterns = [matchstr(detected.bufname, '/\zs[^][{}*?$~\`/]\+\ze/\=$')]
+                                  let dir = fnamemodify(dir, ':h')
+                                  if empty(detected.patterns[0])
+                                    let detected.patterns = []
+                                  endif
+                                endif
+    1              0.000000   endif
+    1              0.000005   while c > 0 && dir !~# '^$\|^//[^/]*$' && dir !=# fnamemodify(dir, ':h')
+                                for pattern in detected.patterns
+                                  for neighbor in split(glob(dir.'/'.pattern), "\n")[0:7]
+                                    if neighbor !=# detected.path && filereadable(neighbor)
+                                      call s:Guess(neighbor, detected, readfile(neighbor, '', 256))
+                                      let c -= 1
+                                    endif
+                                    if s:Ready(detected)
+                                      return detected
+                                    endif
+                                    if c <= 0
+                                      break
+                                    endif
+                                  endfor
+                                  if c <= 0
+                                    break
+                                  endif
+                                endfor
+                                if len(dir) <= len(root)
+                                  break
+                                endif
+                                let dir = fnamemodify(dir, ':h')
+    1              0.000001   endwhile
+    1              0.000001   if !has_key(options, 'shiftwidth')
+    1              0.000002     let detected.options = copy(detected.declared)
+    1              0.000000   endif
+    1              0.000001   return detected
+
+FUNCTION  <SNR>41_SynSet()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\syntax\synload.vim:27
+Called 17 times
+Total time:   0.100190
+ Self time:   0.100190
+
+count  total (s)   self (s)
+                              " clear syntax for :set syntax=OFF  and any syntax name that doesn't exist
+   17              0.000054   syn clear
+   17              0.000032   if exists("b:current_syntax")
+                                unlet b:current_syntax
+   17              0.000007   endif
+                            
+   17              0.000042   0verbose let s = expand("<amatch>")
+   17              0.000019   if s == "ON"
+                                " :set syntax=ON
+                                if &filetype == ""
+                                  echohl ErrorMsg
+                                  echo "filetype unknown"
+                                  echohl None
+                                endif
+                                let s = &filetype
+   17              0.000015   elseif s == "OFF"
+                                let s = ""
+   17              0.000005   endif
+                            
+   17              0.000011   if s != ""
+                                " Load the syntax file(s).  When there are several, separated by dots,
+                                " load each in sequence.  Skip empty entries.
+   32              0.000082     for name in split(s, '\.')
+   16              0.000018       if !empty(name)
+                                    " XXX: "[.]" in the first pattern makes it a wildcard on Windows
+   16              0.089675         exe $'runtime! syntax/{name}[.]{{vim,lua}} syntax/{name}/*.{{vim,lua}}'
+   16              0.000027       endif
+   32              0.009908     endfor
+   17              0.000009   endif
+
+FUNCTION  <SNR>23_EditorConfigToOptions()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:329
+Called 2 times
+Total time:   0.000128
+ Self time:   0.000128
+
+count  total (s)   self (s)
+    2              0.000002   let options = {}
+    2              0.000007   let pairs = map(copy(a:pairs), 'v:val[0]')
+    2              0.000003   let sources = map(copy(a:pairs), 'v:val[1:-1]')
+    2              0.000003   call filter(pairs, 'v:val !=? "unset"')
+                            
+    2              0.000003   if get(pairs, 'indent_style', '') ==? 'tab'
+                                let options.expandtab = [0] + sources.indent_style
+    2              0.000003   elseif get(pairs, 'indent_style', '') ==? 'space'
+                                let options.expandtab = [1] + sources.indent_style
+    2              0.000001   endif
+                            
+    2              0.000011   if get(pairs, 'indent_size', '') =~? '^[1-9]\d*$\|^tab$'
+                                let options.shiftwidth = [str2nr(pairs.indent_size)] + sources.indent_size
+                                if &g:shiftwidth == 0 && !has_key(pairs, 'tab_width') && pairs.indent_size !=? 'tab'
+                                  let options.tabstop = options.shiftwidth
+                                  let options.shiftwidth = [0] + sources.indent_size
+                                endif
+    2              0.000000   endif
+                            
+    2              0.000008   if get(pairs, 'tab_width', '') =~? '^[1-9]\d*$'
+                                let options.tabstop = [str2nr(pairs.tab_width)] + sources.tab_width
+                                if !has_key(pairs, 'indent_size') && get(pairs, 'indent_style', '') ==? 'tab'
+                                  let options.shiftwidth = [0] + options.tabstop[1:-1]
+                                endif
+    2              0.000000   endif
+                            
+    2              0.000006   if get(pairs, 'max_line_length', '') =~? '^[1-9]\d*$\|^off$'
+                                let options.textwidth = [str2nr(pairs.max_line_length)] + sources.max_line_length
+    2              0.000000   endif
+                            
+    2              0.000007   if get(pairs, 'insert_final_newline', '') =~? '^true$\|^false$'
+                                let options.endofline = [pairs.insert_final_newline ==? 'true'] + sources.insert_final_newline
+                                let options.fixendofline = copy(options.endofline)
+    2              0.000000   endif
+                            
+    2              0.000004   let eol = tolower(get(pairs, 'end_of_line', ''))
+    2              0.000003   if has_key(s:editorconfig_fileformat, eol)
+                                let options.fileformat = [s:editorconfig_fileformat[eol]] + sources.end_of_line
+    2              0.000000   endif
+                            
+    2              0.000003   let charset = tolower(get(pairs, 'charset', ''))
+    2              0.000003   if has_key(s:editorconfig_bomb, charset)
+                                let options.bomb = [s:editorconfig_bomb[charset]] + sources.charset
+                                let options.fileencoding = [substitute(charset, '\C-bom$', '', '')] + sources.charset
+    2              0.000000   endif
+                            
+    2              0.000003   let filetype = tolower(get(pairs, 'vim_filetype', 'unset'))
+    2              0.000002   if filetype !=# 'unset' && filetype =~# '^[.a-z0-9_-]*$'
+                                let options.filetype = [substitute(filetype, '^\.\+\|\.\+$', '', 'g')] + sources.vim_filetype
+    2              0.000000   endif
+                            
+    2              0.000001   return options
+
+FUNCTION  <SNR>42_Focus()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:437
+Called 8 times
+Total time:   0.000625
+ Self time:   0.000147
+
+count  total (s)   self (s)
+    8   0.000339   0.000081   if s:Running() && copilot#Client().IsAttached(a:bufnr)
+    3   0.000259   0.000039     call copilot#Client().Notify('textDocument/didFocus', {'textDocument': {'uri': copilot#Client().Attach(a:bufnr).uri}})
+    8              0.000003   endif
+
+FUNCTION  copilot#OnBufUnload()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:469
+Called 21 times
+Total time:   0.000007
+ Self time:   0.000007
+
+count  total (s)   self (s)
+
+FUNCTION  <SNR>47_RejectRequest()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:49
+Called 25 times
+Total time:   0.001265
+ Self time:   0.001185
+
+count  total (s)   self (s)
+   25              0.000030   if a:request.status !=# 'running'
+                                return
+   25              0.000007   endif
+   25              0.000039   let a:request.waiting = {}
+   25              0.000068   call remove(a:request, 'resolve')
+   25              0.000044   let reject = remove(a:request, 'reject')
+   25              0.000024   let a:request.status = 'error'
+   25              0.000063   let a:request.error = deepcopy(a:error)
+   50              0.000093   for Cb in reject
+   25              0.000209     let a:request.waiting[timer_start(0, function('s:Callback', [a:request, 'error', Cb]))] = 1
+   50              0.000025   endfor
+   25              0.000092   if index([s:error_canceled.code, s:error_connection_inactive.code], a:error.code) != -1
+                                return
+   25              0.000007   endif
+   25              0.000159   let msg = 'Method ' . a:request.method . ' errored with E' . a:error.code . ': ' . json_encode(a:error.message)
+   25              0.000027   if empty(reject)
+                                call copilot#logger#Error(msg)
+   25              0.000008   else
+   25   0.000184   0.000103     call copilot#logger#Debug(msg)
+   25              0.000009   endif
+
+FUNCTION  <SNR>23_Apply()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:396
+Called 2 times
+Total time:   0.000238
+ Self time:   0.000234
+
+count  total (s)   self (s)
+    2              0.000036   let options = extend(copy(a:detected.defaults), a:detected.options)
+    2              0.000006   if get(a:detected.defaults, 'shiftwidth', [1])[0] == 0 && get(options, 'shiftwidth', [0])[0] != 0 && !has_key(a:detected.declared, 'tabstop')
+                                let options.tabstop = options.shiftwidth
+                                let options.shiftwidth = a:detected.defaults.shiftwidth
+    2              0.000001   endif
+    2              0.000003   if has_key(options, 'shiftwidth') && !has_key(options, 'expandtab')
+                                let options.expandtab = [stridx(join(getline(1, 256), "\n"), "\t") == -1, a:detected.bufname]
+    2              0.000000   endif
+    2              0.000004   if !exists('*shiftwidth') && !get(options, 'shiftwidth', [1])[0]
+                                let options.shiftwidth = [get(options, 'tabstop', [&tabstop])[0]] + options.shiftwidth[1:-1]
+    2              0.000000   endif
+    2              0.000001   let msg = ''
+    2              0.000001   let cmd = 'setlocal'
+   22              0.000011   for option in a:permitted_options
+   20              0.000046     if !exists('&' . option) || !has_key(options, option) || !&l:modifiable && index(s:safe_options, option) == -1
+   18              0.000005       continue
+    2              0.000000     endif
+    2              0.000002     let value = options[option]
+    2              0.000002     if has_key(s:booleans, option)
+    1              0.000001       let setting = (value[0] ? '' : 'no') . option
+    1              0.000000     else
+    1              0.000001       let setting = option . '=' . value[0]
+    2              0.000000     endif
+    2              0.000006     if getbufvar('', '&' . option) !=# value[0] || index(s:safe_options, option) >= 0
+    2              0.000003       let cmd .= ' ' . setting
+    2              0.000000     endif
+    2              0.000001     if !&verbose || a:silent
+    2              0.000002       if has_key(s:booleans, option)
+    1              0.000003         let msg .= ' ' . (value[0] ? '' : 'no') . get(s:short_options, option, option)
+    1              0.000000       else
+    1              0.000002         let msg .= ' ' . get(s:short_options, option, option) . '=' . value[0]
+    2              0.000000       endif
+    2              0.000000       continue
+                                endif
+                                if len(value) > 1
+                                  if value[1] ==# a:detected.bufname
+                                    let file = '%'
+                                  else
+                                    let file = value[1] =~# '/' ? fnamemodify(value[1], ':~:.') : value[1]
+                                    if file !=# value[1] && file[0:0] !=# '~'
+                                      let file = './' . file
+                                    endif
+                                  endif
+                                  if len(value) > 2
+                                    let file .= ' line ' . value[2]
+                                  endif
+                                  echo printf(':setlocal %-21s " from %s', setting, file)
+                                else
+                                  echo ':setlocal ' . setting
+                                endif
+    2              0.000002   endfor
+    2              0.000003   if !&verbose && !empty(msg) && !a:silent
+                                echo ':setlocal' . msg
+    2              0.000000   endif
+    2              0.000002   if has_key(options, 'shiftwidth')
+    1              0.000003     let cmd .= ' softtabstop=' . (exists('*shiftwidth') ? -1 : options.shiftwidth[0])
+    1              0.000000   else
+    1   0.000008   0.000004     call s:Warn(':Sleuth failed to detect indent settings', a:silent)
+    2              0.000001   endif
+    2              0.000002   return cmd ==# 'setlocal' ? '' : cmd
+
+FUNCTION  <SNR>42_Running()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:30
+Called 134 times
+Total time:   0.000740
+ Self time:   0.000740
+
+count  total (s)   self (s)
+  134              0.000634   return exists('s:client.job') || exists('s:client.client_id')
+
+FUNCTION  copilot#Clear()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:94
+Called 16 times
+Total time:   0.002891
+ Self time:   0.000304
+
+count  total (s)   self (s)
+   16              0.000032   if exists('g:_copilot_timer')
+    1              0.000004     call timer_stop(remove(g:, '_copilot_timer'))
+   16              0.000010   endif
+   16              0.000024   if exists('b:_copilot')
+    2   0.000133   0.000014     call copilot#client#Cancel(get(b:_copilot, 'first', {}))
+    2   0.000018   0.000010     call copilot#client#Cancel(get(b:_copilot, 'cycling', {}))
+   16              0.000005   endif
+   16   0.002528   0.000068   call s:UpdatePreview()
+   16              0.000020   unlet! b:_copilot
+   16              0.000009   return ''
+
+FUNCTION  <SNR>23_UserOptions()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:460
+Called 2 times
+Total time:   0.000020
+ Self time:   0.000020
+
+count  total (s)   self (s)
+    2              0.000004   if exists('b:sleuth_' . a:name)
+                                let source = 'b:sleuth_' . a:name
+    2              0.000004   elseif exists('g:sleuth_' . a:ft . '_' . a:name)
+                                let source = 'g:sleuth_' . a:ft . '_' . a:name
+    2              0.000000   endif
+    2              0.000004   if !exists('l:source') || type(eval(source)) == type(function('tr'))
+    2              0.000001     return {}
+                              endif
+                              let val = eval(source)
+                              let options = {}
+                              if type(val) == type('')
+                                call s:ParseOptions(split(substitute(val, '\S\@<![=+]\S\@=', 'ft=', 'g'), '[[:space:]:,]\+'), options, source)
+                                if has_key(options, 'filetype')
+                                  call extend(options, s:UserOptions(remove(options, 'filetype')[0], a:name), 'keep')
+                                endif
+                                if has_key(options, 'tabstop')
+                                  call extend(options, {'shiftwidth': [0, source], 'expandtab': [0, source]}, 'keep')
+                                elseif has_key(options, 'shiftwidth')
+                                  call extend(options, {'expandtab': [1, source]}, 'keep')
+                                endif
+                              elseif type(val) == type([])
+                                call s:ParseOptions(val, options, source)
+                              endif
+                              call filter(options, 'index(s:safe_options, v:key) >= 0')
+                              return options
+
+FUNCTION  <SNR>57_CleanUp()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:255
+Called 8 times
+Total time:   0.000802
+ Self time:   0.000399
+
+count  total (s)   self (s)
+    8              0.000011   if strlen(a:options)
+    8   0.000460   0.000057     execute "set" a:options
+    8              0.000004   endif
+                              " Open folds, if appropriate.
+    8              0.000009   if a:mode != "o"
+    8              0.000029     if &foldopen =~ "percent"
+    8              0.000159       normal! zv
+    8              0.000004     endif
+                                " In Operator-pending mode, we want to include the whole match
+                                " (for example, d%).
+                                " This is only a problem if we end up moving in the forward direction.
+                              elseif (a:startpos[0] < line(".")) || (a:startpos[0] == line(".") && a:startpos[1] < col("."))
+                                if a:0
+                                  " Check whether the match is a single character.  If not, move to the
+                                  " end of the match.
+                                  let matchline = getline(".")
+                                  let currcol = col(".")
+                                  let regexp = s:Wholematch(matchline, a:1, currcol-1)
+                                  let endcol = matchend(matchline, regexp)
+                                  if endcol > currcol  " This is NOT off by one!
+                                    call cursor(0, endcol)
+                                  endif
+                                endif " a:0
+    8              0.000003   endif " a:mode != "o" && etc.
+    8              0.000005   return 0
+
+FUNCTION  copilot#Complete()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:155
+Called 25 times
+Total time:   0.012806
+ Self time:   0.001992
+
+count  total (s)   self (s)
+   25              0.000043   if exists('g:_copilot_timer')
+                                call timer_stop(remove(g:, '_copilot_timer'))
+   25              0.000009   endif
+   25              0.000141   let target = [bufnr(''), getbufvar('', 'changedtick'), line('.'), col('.')]
+   25              0.000087   if !exists('b:_copilot.target') || b:_copilot.target !=# target
+   25              0.000041     if exists('b:_copilot.first')
+   23   0.001119   0.000116       call copilot#client#Cancel(b:_copilot.first)
+   25              0.000009     endif
+   25              0.000038     if exists('b:_copilot.cycling')
+                                  call copilot#client#Cancel(b:_copilot.cycling)
+   25              0.000009     endif
+   25   0.001295   0.000334     let params = { 'textDocument': {'uri': bufnr('')}, 'position': copilot#util#AppendPosition(), 'formattingOptions': {'insertSpaces': &expandtab ? v:true : v:false, 'tabSize': shiftwidth()}, 'context': {'triggerKind': s:inline_automatic}}
+   25   0.008660   0.000177     let b:_copilot = { 'target': target, 'params': params, 'first': copilot#Request('textDocument/inlineCompletion', params)}
+   25              0.000239     let g:_copilot_last = b:_copilot
+   25              0.000010   endif
+   25              0.000034   let completion = b:_copilot.first
+   25              0.000018   if !a:0
+                                return completion.Await()
+   25              0.000012   else
+   25   0.000420   0.000216     call copilot#client#Result(completion, function(a:1, [b:_copilot]))
+   25              0.000020     if a:0 > 1
+   25   0.000302   0.000138       call copilot#client#Error(completion, function(a:2, [b:_copilot]))
+   25              0.000009     endif
+   25              0.000008   endif
+
+FUNCTION  <SNR>10_Event()
+    Defined: ~/AppData/Local/nvim-data/lazy/copilot.vim/plugin/copilot.vim:45
+Called 111 times
+Total time:   0.019055
+ Self time:   0.001479
+
+count  total (s)   self (s)
+  111              0.000150   try
+  111   0.018451   0.000875     call call('copilot#On' . a:type, [])
+                              catch
+                                call copilot#logger#Exception('autocmd.' . a:type)
+  111              0.000063   endtry
+
+FUNCTION  copilot#util#AppendPosition()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\util.vim:56
+Called 25 times
+Total time:   0.000961
+ Self time:   0.000654
+
+count  total (s)   self (s)
+   25              0.000053   let line = getline('.')
+   25              0.000312   let col_byte = col('.') - (mode() =~# '^[iR]' || empty(line))
+   25   0.000491   0.000183   let col_utf16 = copilot#util#UTF16Width(strpart(line, 0, col_byte))
+   25              0.000069   return {'line': line('.') - 1, 'character': col_utf16}
+
+FUNCTION  <SNR>1_LoadFTPlugin()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\ftplugin.vim:15
+Called 17 times
+Total time:   0.169061
+ Self time:   0.154527
+
+count  total (s)   self (s)
+   17              0.000087     if exists("b:undo_ftplugin")
+                                  exe b:undo_ftplugin
+                                  unlet! b:undo_ftplugin b:did_ftplugin
+   17              0.000010     endif
+                            
+   17              0.000074     let s = expand("<amatch>")
+   17              0.000025     if s != ""
+   17              0.000090       if &cpo =~# "S" && exists("b:did_ftplugin")
+                            	" In compatible mode options are reset to the global values, need to
+                            	" set the local values also when a plugin was already used.
+                            	unlet b:did_ftplugin
+   17              0.000006       endif
+                            
+                                  " When there is a dot it is used to separate filetype names.  Thus for
+                                  " "aaa.bbb" load "aaa" and then "bbb".
+   34              0.000118       for name in split(s, '\.')
+                                    " Load Lua ftplugins after Vim ftplugins _per directory_
+                                    " TODO(clason): use nvim__get_runtime when supports globs and modeline
+                                    " XXX: "[.]" in the first pattern makes it a wildcard on Windows
+   17   0.168324   0.153790         exe $'runtime! ftplugin/{name}[.]{{vim,lua}} ftplugin/{name}_*.{{vim,lua}} ftplugin/{name}/*.{{vim,lua}}'
+   34              0.000056       endfor
+   17              0.000014     endif
+
+FUNCTION  <SNR>47_OnResponse()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:341
+Called 25 times
+Total time:   0.002094
+ Self time:   0.000829
+
+count  total (s)   self (s)
+   25              0.000035   let response = a:response
+   25              0.000048   let id = get(a:response, 'id', v:null)
+   25              0.000041   if !has_key(a:instance.requests, id)
+                                return
+   25              0.000007   endif
+   25              0.000055   let request = remove(a:instance.requests, id)
+   25              0.000046   for progress_token in request.progress
+                                if has_key(a:instance.progress, progress_token)
+                                  call remove(a:instance.progress, progress_token)
+                                endif
+   25              0.000015   endfor
+   25              0.000030   if request.status !=# 'running'
+                                return
+   25              0.000008   endif
+   25              0.000030   if has_key(response, 'result')
+                                let request.waiting = {}
+                                let resolve = remove(request, 'resolve')
+                                call remove(request, 'reject')
+                                let request.status = 'success'
+                                let request.result = response.result
+                                for Cb in resolve
+                                  let request.waiting[timer_start(0, function('s:Callback', [request, 'result', Cb]))] = 1
+                                endfor
+   25              0.000011   else
+   25   0.001397   0.000132     call s:RejectRequest(request, response.error)
+   25              0.000007   endif
+
+FUNCTION  copilot#Enabled()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:147
+Called 61 times
+Total time:   0.003328
+ Self time:   0.000534
+
+count  total (s)   self (s)
+   61   0.003289   0.000494   return get(g:, 'copilot_enabled', 1) && empty(s:BufferDisabled())
+
+FUNCTION  GetLuaIndentIntern()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\indent\lua.vim:40
+Called 1 time
+Total time:   0.000074
+ Self time:   0.000074
+
+count  total (s)   self (s)
+                              " Find a non-blank line above the current line.
+    1              0.000004   let prevlnum = prevnonblank(v:lnum - 1)
+                            
+                              " Hit the start of the file, use zero indent.
+    1              0.000002   if prevlnum == 0
+                                return 0
+    1              0.000001   endif
+                            
+                              " Add a 'shiftwidth' after lines that start a block:
+                              " 'function', 'if', 'for', 'while', 'repeat', 'else', 'elseif', '{', '('
+    1              0.000002   let ind = indent(prevlnum)
+    1              0.000002   let prevline = getline(prevlnum)
+    1              0.000018   let midx = match(prevline, '^\s*\%(if\>\|for\>\|while\>\|repeat\>\|else\>\|elseif\>\|do\>\|then\>\)')
+    1              0.000001   if midx == -1
+    1              0.000011     let midx = match(prevline, '\%({\|(\)\s*\%(--\%([^[].*\)\?\)\?$')
+    1              0.000001     if midx == -1
+    1              0.000005       let midx = match(prevline, '\<function\>\s*\%(\k\|[.:]\)\{-}\s*(')
+    1              0.000000     endif
+    1              0.000000   endif
+                            
+    1              0.000000   if midx != -1
+                                " Add 'shiftwidth' if what we found previously is not in a comment and
+                                " an "end" or "until" is not present on the same line.
+                                if synIDattr(synID(prevlnum, midx + 1, 1), "name") != "luaComment" && prevline !~ '\<end\>\|\<until\>'
+                                  let ind = ind + shiftwidth()
+                                endif
+    1              0.000000   endif
+                            
+                              " Subtract a 'shiftwidth' on end, else, elseif, until, '}' and ')'
+                              " This is the part that requires 'indentkeys'.
+    1              0.000007   let midx = match(getline(v:lnum), '^\s*\%(end\>\|else\>\|elseif\>\|until\>\|}\|)\)')
+    1              0.000002   if midx != -1 && synIDattr(synID(v:lnum, midx + 1, 1), "name") != "luaComment"
+                                let ind = ind - shiftwidth()
+    1              0.000000   endif
+                            
+    1              0.000001   return ind
+
+FUNCTION  <SNR>42_UpdatePreview()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:306
+Called 90 times
+Total time:   0.013811
+ Self time:   0.007488
+
+count  total (s)   self (s)
+   90              0.000057   try
+   90   0.005469   0.000616     let [text, outdent, delete_chars, item] = s:SuggestionTextWithAdjustments()
+   90              0.000203     let delete = strchars(delete_chars)
+   90              0.000411     let text = split(text, "\r\n\\=\\|\n", 1)
+   90              0.000142     if empty(text[-1])
+   90              0.000186       call remove(text, -1)
+   90              0.000035     endif
+   90              0.000103     if empty(text) || !s:has_ghost_text
+   90   0.001817   0.000346       return s:ClearPreview()
+                                endif
+                                if exists('b:_copilot.cycling_callbacks')
+                                  let annot = '(1/…)'
+                                elseif exists('b:_copilot.cycling')
+                                  let annot = '(' . (b:_copilot.choice + 1) . '/' . len(b:_copilot.suggestions) . ')'
+                                else
+                                  let annot = ''
+                                endif
+                                call s:ClearPreview()
+                                if s:has_nvim_ghost_text
+                                  let data = {'id': 1}
+                                  let data.virt_text_pos = 'overlay'
+                                  let append = strpart(getline('.'), col('.') - 1 + delete)
+                                  let data.virt_text = [[text[0] . append . repeat(' ', delete - len(text[0])), s:hlgroup]]
+                                  if len(text) > 1
+                                    let data.virt_lines = map(text[1:-1], { _, l -> [[l, s:hlgroup]] })
+                                    if !empty(annot)
+                                      let data.virt_lines[-1] += [[' '], [annot, s:annot_hlgroup]]
+                                    endif
+                                  elseif len(annot)
+                                    let data.virt_text += [[' '], [annot, s:annot_hlgroup]]
+                                  endif
+                                  let data.hl_mode = 'combine'
+                                  call nvim_buf_set_extmark(0, copilot#NvimNs(), line('.')-1, col('.')-1, data)
+                                elseif s:has_vim_ghost_text
+                                  let new_suffix = text[0]
+                                  let current_suffix = getline('.')[col('.') - 1 :]
+                                  let inset = ''
+                                  while delete > 0 && !empty(new_suffix)
+                                    let last_char = matchstr(new_suffix, '.$')
+                                    let new_suffix = matchstr(new_suffix, '^.\{-\}\ze.$')
+                                    if last_char ==# matchstr(current_suffix, '.$')
+                                      if !empty(inset)
+                                        call prop_add(line('.'), col('.') + len(current_suffix), {'type': s:hlgroup, 'text': inset})
+                                        let inset = ''
+                                      endif
+                                      let current_suffix = matchstr(current_suffix, '^.\{-\}\ze.$')
+                                      let delete -= 1
+                                    else
+                                      let inset = last_char . inset
+                                    endif
+                                  endwhile
+                                  if !empty(new_suffix . inset)
+                                    call prop_add(line('.'), col('.'), {'type': s:hlgroup, 'text': new_suffix . inset})
+                                  endif
+                                  for line in text[1:]
+                                    call prop_add(line('.'), 0, {'type': s:hlgroup, 'text_align': 'below', 'text': line})
+                                  endfor
+                                  if !empty(annot)
+                                    call prop_add(line('.'), col('$'), {'type': s:annot_hlgroup, 'text': ' ' . annot})
+                                  endif
+                                endif
+                                call copilot#Notify('textDocument/didShowCompletion', {'item': item})
+                              catch
+                                return copilot#logger#Exception()
+   90              0.000051   endtry
+
+FUNCTION  <SNR>42_SuggestionTextWithAdjustments()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:193
+Called 90 times
+Total time:   0.004852
+ Self time:   0.004623
+
+count  total (s)   self (s)
+   90              0.000178   let empty = ['', 0, '', {}]
+   90              0.000033   try
+   90   0.001407   0.001177     if mode() !~# '^[iR]' || (s:HideDuringCompletion() && pumvisible()) || !exists('b:_copilot.suggestions')
+   20              0.000018       return empty
+   70              0.000025     endif
+   70              0.000163     let choice = get(b:_copilot.suggestions, b:_copilot.choice, {})
+   70              0.000214     if !has_key(choice, 'range') || choice.range.start.line != line('.') - 1 || type(choice.insertText) !=# v:t_string
+   70              0.000062       return empty
+                                endif
+                                let line = getline('.')
+                                let offset = col('.') - 1
+                                let byte_offset = copilot#util#UTF16ToByteIdx(line, choice.range.start.character)
+                                let choice_text = strpart(line, 0, byte_offset) . substitute(substitute(choice.insertText, '\r\n\=', '\n', 'g'), '\n*$', '', '')
+                                let typed = strpart(line, 0, offset)
+                                let end_offset = copilot#util#UTF16ToByteIdx(line, choice.range.end.character)
+                                if end_offset < 0
+                                  let end_offset = len(line)
+                                endif
+                                let delete = strpart(line, offset, end_offset - offset)
+                                if typed =~# '^\s*$'
+                                  let leading = strpart(matchstr(choice_text, '^\s\+'), 0, len(typed))
+                                  let unindented = strpart(choice_text, len(leading))
+                                  if strpart(typed, 0, len(leading)) ==# leading && unindented !=# delete
+                                    return [unindented, len(typed) - len(leading), delete, choice]
+                                  endif
+                                elseif typed ==# strpart(choice_text, 0, offset)
+                                  return [strpart(choice_text, offset), 0, delete, choice]
+                                endif
+                              catch
+                                call copilot#logger#Exception()
+   90              0.000066   endtry
+                              return empty
+
+FUNCTION  <SNR>23_Init()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:593
+Called 2 times
+Total time:   0.007364
+ Self time:   0.000137
+
+count  total (s)   self (s)
+    2              0.000004   if !a:redetect && exists('b:sleuth.defaults')
+                                let detected = b:sleuth
+    2              0.000001   endif
+    2              0.000004   unlet! b:sleuth
+    2              0.000015   if &l:buftype !~# '^\%(nowrite\|nofile\|acwrite\)\=$'
+                                return s:Warn(':Sleuth disabled for buftype=' . &l:buftype, a:silent)
+    2              0.000001   endif
+    2              0.000002   if &l:filetype ==# 'netrw'
+                                return s:Warn(':Sleuth disabled for filetype=' . &l:filetype, a:silent)
+    2              0.000001   endif
+    2              0.000002   if &l:binary
+                                return s:Warn(':Sleuth disabled for binary files', a:silent)
+    2              0.000001   endif
+    2              0.000004   if !exists('detected')
+    2   0.001595   0.000010     let detected = s:DetectDeclared()
+    2              0.000001   endif
+    2              0.000001   let setfiletype = ''
+    2              0.000003   if a:do_filetype && has_key(detected.declared, 'filetype')
+                                let filetype = detected.declared.filetype[0]
+                                if filetype !=# &l:filetype || empty(filetype)
+                                  let setfiletype = 'setlocal filetype=' . filetype
+                                else
+                                  let setfiletype = 'setfiletype ' . filetype
+                                endif
+    2              0.000000   endif
+    2              0.000003   exe setfiletype
+    2   0.005428   0.000024   call s:DetectHeuristics(detected)
+    2   0.000254   0.000016   let cmd = s:Apply(detected, (a:do_filetype ? ['filetype'] : []) + (a:unsafe ? s:all_options : s:safe_options), a:silent)
+    2              0.000002   let b:sleuth = detected
+    2              0.000003   if exists('s:polyglot') && !a:silent
+                                call s:Warn('Charlatan :Sleuth implementation in vim-polyglot has been found and disabled.')
+                                call s:Warn('To get rid of this message, uninstall vim-polyglot, or disable the')
+                                call s:Warn('corresponding feature in your vimrc:')
+                                call s:Warn('        let g:polyglot_disabled = ["autoindent"]')
+    2              0.000001   endif
+    2              0.000001   return cmd
+
+FUNCTION  <SNR>42_HandleTriggerError()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:382
+Called 25 times
+Total time:   0.003975
+ Self time:   0.000282
+
+count  total (s)   self (s)
+   25              0.000040   let a:state.suggestions = []
+   25              0.000025   let a:state.choice = 0
+   25              0.000025   let a:state.error = a:result
+   25              0.000047   if get(b:, '_copilot') is# a:state
+   25   0.003795   0.000102     call s:UpdatePreview()
+   25              0.000008   endif
+
+FUNCTION  <SNR>23_DetectEditorConfig()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:270
+Called 2 times
+Total time:   0.000883
+ Self time:   0.000883
+
+count  total (s)   self (s)
+    2              0.000004   if empty(a:absolute_path)
+    1              0.000001     return [{}, '']
+    1              0.000000   endif
+    1              0.000001   let root = ''
+    1              0.000001   let tail = a:0 ? a:1 : '.editorconfig'
+    1              0.000003   let dir = fnamemodify(a:absolute_path, ':h')
+    1              0.000001   let previous_dir = ''
+    1              0.000001   let sections = []
+    1              0.000002   let overrides = get(g:, 'sleuth_editorconfig_overrides', {})
+    9              0.000040   while dir !=# previous_dir && dir !~# '^//\%([^/]\+/\=\)\=$'
+    8              0.000037     let head = substitute(dir, '/\=$', '/', '')
+    8              0.000024     let read_from = get(overrides, head . tail, get(overrides, head, head . tail))
+    8              0.000006     if read_from is# ''
+                                  break
+    8              0.000018     elseif type(read_from) == type('') && read_from !=# head . tail && read_from !~# '^/\|^\a\+:'
+                                  let read_from = simplify(head . read_from)
+    8              0.000002     endif
+    8              0.000552     let ftime = type(read_from) == type('') ? getftime(read_from) : -1
+    8              0.000038     let [cachetime; econfig] = get(s:editorconfig_cache, read_from, [-1, {}, []])
+    8              0.000007     if ftime != cachetime
+                                  let econfig = s:ReadEditorConfig(read_from)
+                                  let s:editorconfig_cache[read_from] = [ftime] + econfig
+                                  lockvar! s:editorconfig_cache[read_from]
+                                  unlockvar s:editorconfig_cache[read_from]
+    8              0.000003     endif
+    8              0.000018     call extend(sections, econfig[1], 'keep')
+    8              0.000014     if get(econfig[0], 'root', [''])[0] ==? 'true'
+                                  let root = head
+                                  break
+    8              0.000002     endif
+    8              0.000006     let previous_dir = dir
+    8              0.000013     let dir = fnamemodify(dir, ':h')
+    9              0.000004   endwhile
+                            
+    1              0.000001   let config = {}
+    1              0.000001   for [pattern, pairs] in sections
+                                if a:absolute_path =~# pattern
+                                  call extend(config, pairs)
+                                endif
+    1              0.000000   endfor
+                            
+    1              0.000001   return [config, root]
+
+FUNCTION  matchit#Match_wrapper()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:52
+Called 8 times
+Total time:   0.022294
+ Self time:   0.008448
+
+count  total (s)   self (s)
+    8   0.000673   0.000056   let restore_options = s:RestoreOptions()
+                              " In s:CleanUp(), we may need to check whether the cursor moved forward.
+    8              0.000027   let startpos = [line("."), col(".")]
+                              " if a count has been applied, use the default [count]% mode (see :h N%)
+    8              0.000007   if v:count
+                                exe "normal! " .. v:count .. "%"
+                                return s:CleanUp(restore_options, a:mode, startpos)
+    8              0.000003   end
+    8              0.000052   if a:mode =~# "v" && mode(1) =~# 'ni'
+                                exe "norm! gv"
+    8              0.000012   elseif a:mode == "o" && mode(1) !~# '[vV]'
+                                exe "norm! v"
+                              " If this function was called from Visual mode, make sure that the cursor
+                              " is at the correct end of the Visual range:
+    8              0.000005   elseif a:mode == "v"
+                                execute "normal! gv\<Esc>"
+                                let startpos = [line("."), col(".")]
+    8              0.000003   endif
+                            
+                              " First step:  if not already done, set the script variables
+                              "   s:do_BR   flag for whether there are backrefs
+                              "   s:pat     parsed version of b:match_words
+                              "   s:all     regexp based on s:pat and the default groups
+    8              0.000025   if !exists("b:match_words") || b:match_words == ""
+                                let match_words = ""
+    8              0.000025   elseif b:match_words =~ ":"
+    8              0.000010     let match_words = b:match_words
+                              else
+                                " Allow b:match_words = "GetVimMatchWords()" .
+                                execute "let match_words =" b:match_words
+    8              0.000003   endif
+                            " Thanks to Preben "Peppe" Guldberg and Bram Moolenaar for this suggestion!
+    8              0.000025   if (match_words != s:last_words) || (&mps != s:last_mps) || exists("b:match_debug")
+    8              0.000012     let s:last_mps = &mps
+                                " quote the special chars in 'matchpairs', replace [,:] with \| and then
+                                " append the builtin pairs (/*, */, #if, #ifdef, #ifndef, #else, #elif,
+                                " #elifdef, #elifndef, #endif)
+    8              0.000037     let default = escape(&mps, '[$^.*~\\/?]') .. (strlen(&mps) ? "," : "") .. '\/\*:\*\/,#\s*if\%(n\=def\)\=:#\s*else\>:#\s*elif\%(n\=def\)\=\>:#\s*endif\>'
+                                " s:all = pattern with all the keywords
+    8              0.000023     let match_words = match_words .. (strlen(match_words) ? "," : "") .. default
+    8              0.000009     let s:last_words = match_words
+    8              0.000142     if match_words !~ s:notslash .. '\\\d'
+                                  let s:do_BR = 0
+                                  let s:pat = match_words
+    8              0.000003     else
+    8              0.000006       let s:do_BR = 1
+    8   0.008296   0.000083       let s:pat = s:ParseWords(match_words)
+    8              0.000003     endif
+    8              0.000282     let s:all = substitute(s:pat, s:notslash .. '\zs[,:]\+', '\\|', 'g')
+                                " un-escape \, to ,
+    8              0.000027     let s:all = substitute(s:all, '\\,', ',', 'g')
+                                " Just in case there are too many '\(...)' groups inside the pattern, make
+                                " sure to use \%(...) groups, so that error E872 can be avoided
+    8              0.000032     let s:all = substitute(s:all, '\\(', '\\%(', 'g')
+    8              0.000014     let s:all = '\%(' .. s:all .. '\)'
+    8              0.000016     if exists("b:match_debug")
+                                  let b:match_pat = s:pat
+    8              0.000003     endif
+                                " Reconstruct the version with unresolved backrefs.
+    8              0.000291     let s:patBR = substitute(match_words .. ',', s:notslash .. '\zs[,:]*,[,:]*', ',', 'g')
+    8              0.000180     let s:patBR = substitute(s:patBR, s:notslash .. '\zs:\{2,}', ':', 'g')
+                                " un-escape \, to ,
+    8              0.000023     let s:patBR = substitute(s:patBR, '\\,', ',', 'g')
+    8              0.000003   endif
+                            
+                              " Second step:  set the following local variables:
+                              "     matchline = line on which the cursor started
+                              "     curcol    = number of characters before match
+                              "     prefix    = regexp for start of line to start of match
+                              "     suffix    = regexp for end of match to end of line
+                              " Require match to end on or after the cursor and prefer it to
+                              " start on or before the cursor.
+    8              0.000023   let matchline = getline(startpos[0])
+    8              0.000008   if a:word != ''
+                                " word given
+                                if a:word !~ s:all
+                                  echohl WarningMsg|echo 'Missing rule for word:"'.a:word.'"'|echohl NONE
+                                  return s:CleanUp(restore_options, a:mode, startpos)
+                                endif
+                                let matchline = a:word
+                                let curcol = 0
+                                let prefix = '^\%('
+                                let suffix = '\)$'
+                              " Now the case when "word" is not given
+    8              0.000003   else  " Find the match that ends on or after the cursor and set curcol.
+    8   0.000581   0.000050     let regexp = s:Wholematch(matchline, s:all, startpos[1]-1)
+    8              0.000308     let curcol = match(matchline, regexp)
+                                " If there is no match, give up.
+    8              0.000006     if curcol == -1
+                                  return s:CleanUp(restore_options, a:mode, startpos)
+    8              0.000003     endif
+    8              0.000279     let endcol = matchend(matchline, regexp)
+    8              0.000013     let suf = strlen(matchline) - endcol
+    8              0.000014     let prefix = (curcol ? '^.*\%' .. (curcol + 1) .. 'c\%(' : '^\%(')
+    8              0.000011     let suffix = (suf ? '\)\%' .. (endcol + 1) .. 'c.*$'  : '\)$')
+    8              0.000003   endif
+    8              0.000011   if exists("b:match_debug")
+                                let b:match_match = matchstr(matchline, regexp)
+                                let b:match_col = curcol+1
+    8              0.000002   endif
+                            
+                              " Third step:  Find the group and single word that match, and the original
+                              " (backref) versions of these.  Then, resolve the backrefs.
+                              " Set the following local variable:
+                              " group = colon-separated list of patterns, one of which matches
+                              "       = ini:mid:fin or ini:fin
+                              "
+                              " Now, set group and groupBR to the matching group: 'if:endif' or
+                              " 'while:endwhile' or whatever.  A bit of a kluge:  s:Choose() returns
+                              " group . "," . groupBR, and we pick it apart.
+    8   0.001441   0.000052   let group = s:Choose(s:pat, matchline, ",", ":", prefix, suffix, s:patBR)
+    8              0.000030   let i = matchend(group, s:notslash .. ",")
+    8              0.000012   let groupBR = strpart(group, i)
+    8              0.000011   let group = strpart(group, 0, i-1)
+                              " Now, matchline =~ prefix . substitute(group,':','\|','g') . suffix
+    8              0.000005   if s:do_BR " Do the hard part:  resolve those backrefs!
+    8   0.002170   0.000045     let group = s:InsertRefs(groupBR, prefix, group, suffix, matchline)
+    8              0.000003   endif
+    8              0.000009   if exists("b:match_debug")
+                                let b:match_wholeBR = groupBR
+                                let i = matchend(groupBR, s:notslash .. ":")
+                                let b:match_iniBR = strpart(groupBR, 0, i-1)
+    8              0.000003   endif
+                            
+                              " Fourth step:  Set the arguments for searchpair().
+    8              0.000035   let i = matchend(group, s:notslash .. ":")
+    8              0.000052   let j = matchend(group, '.*' .. s:notslash .. ":")
+    8              0.000013   let ini = strpart(group, 0, i-1)
+    8              0.000037   let mid = substitute(strpart(group, i,j-i-1), s:notslash .. '\zs:', '\\|', 'g')
+    8              0.000011   let fin = strpart(group, j)
+                              "Un-escape the remaining , and : characters.
+    8              0.000041   let ini = substitute(ini, s:notslash .. '\zs\\\(:\|,\)', '\1', 'g')
+    8              0.000030   let mid = substitute(mid, s:notslash .. '\zs\\\(:\|,\)', '\1', 'g')
+    8              0.000029   let fin = substitute(fin, s:notslash .. '\zs\\\(:\|,\)', '\1', 'g')
+                              " searchpair() requires that these patterns avoid \(\) groups.
+    8              0.000029   let ini = substitute(ini, s:notslash .. '\zs\\(', '\\%(', 'g')
+    8              0.000026   let mid = substitute(mid, s:notslash .. '\zs\\(', '\\%(', 'g')
+    8              0.000026   let fin = substitute(fin, s:notslash .. '\zs\\(', '\\%(', 'g')
+                              " Set mid.  This is optimized for readability, not micro-efficiency!
+    8              0.000046   if a:forward && matchline =~ prefix .. fin .. suffix || !a:forward && matchline =~ prefix .. ini .. suffix
+    3              0.000002     let mid = ""
+    8              0.000003   endif
+                              " Set flag.  This is optimized for readability, not micro-efficiency!
+    8              0.000036   if a:forward && matchline =~ prefix .. fin .. suffix || !a:forward && matchline !~ prefix .. ini .. suffix
+    3              0.000002     let flag = "bW"
+    5              0.000002   else
+    5              0.000004     let flag = "W"
+    8              0.000002   endif
+                              " Set skip.
+    8              0.000010   if exists("b:match_skip")
+                                let skip = b:match_skip
+    8              0.000011   elseif exists("b:match_comment") " backwards compatibility and testing!
+                                let skip = "r:" .. b:match_comment
+    8              0.000002   else
+    8              0.000006     let skip = 's:comment\|string'
+    8              0.000003   endif
+    8   0.000203   0.000033   let skip = s:ParseSkip(skip)
+    8              0.000009   if exists("b:match_debug")
+                                let b:match_ini = ini
+                                let b:match_tail = (strlen(mid) ? mid .. '\|' : '') .. fin
+    8              0.000002   endif
+                            
+                              " Fifth step:  actually start moving the cursor and call searchpair().
+                              " Later, :execute restore_cursor to get to the original screen.
+    8              0.000024   let view = winsaveview()
+    8              0.000025   call cursor(0, curcol + 1)
+    8              0.000072   if skip =~ 'synID' && !(has("syntax") && exists("g:syntax_on")) || skip =~ 'v:lua.vim.treesitter' && !exists('b:ts_highlight')
+                                let skip = "0"
+    8              0.000003   else
+    8              0.002479     execute "if " .. skip .. "| let skip = '0' | endif"
+    8              0.000004   endif
+    8              0.001635   let sp_return = searchpair(ini, mid, fin, flag, skip)
+    8              0.000025   if &selection isnot# 'inclusive' && a:mode == 'v'
+                                " move cursor one pos to the right, because selection is not inclusive
+                                " add virtualedit=onemore, to make it work even when the match ends the
+                                " line
+                                if !(col('.') < col('$')-1)
+                                  let eolmark=1 " flag to set a mark on eol (since we cannot move there)
+                                endif
+                                norm! l
+    8              0.000003   endif
+    8              0.000034   let final_position = "call cursor(" .. line(".") .. "," .. col(".") .. ")"
+                              " Restore cursor position and original screen.
+    8              0.000029   call winrestview(view)
+    8              0.000592   normal! m'
+    8              0.000010   if sp_return > 0
+    8              0.000026     execute final_position
+    8              0.000003   endif
+    8              0.000012   if exists('eolmark') && eolmark
+                                call setpos("''", [0, line('.'), col('$'), 0]) " set mark on the eol
+    8              0.000003   endif
+    8   0.000861   0.000059   return s:CleanUp(restore_options, a:mode, startpos, mid .. '\|' .. fin)
+
+FUNCTION  GetLuaIndent()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\indent\lua.vim:30
+Called 1 time
+Total time:   0.000172
+ Self time:   0.000035
+
+count  total (s)   self (s)
+    1              0.000011     let ignorecase_save = &ignorecase
+    1              0.000001   try
+    1   0.000047   0.000007     let &ignorecase = 0
+    1   0.000081   0.000007     return GetLuaIndentIntern()
+    1              0.000001   finally
+    1   0.000026   0.000003     let &ignorecase = ignorecase_save
+    1              0.000001   endtry
+
+FUNCTION  copilot#NvimNs()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:90
+Called 94 times
+Total time:   0.000402
+ Self time:   0.000402
+
+count  total (s)   self (s)
+   94              0.000360   return nvim_create_namespace('github-copilot')
+
+FUNCTION  copilot#Request()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:75
+Called 25 times
+Total time:   0.008483
+ Self time:   0.000341
+
+count  total (s)   self (s)
+   25   0.000499   0.000095   let client = copilot#Client()
+   25   0.007964   0.000226   return call(client.Request, [a:method, a:params] + a:000)
+
+FUNCTION  <SNR>57_Choose()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:529
+Called 16 times
+Total time:   0.001788
+ Self time:   0.001788
+
+count  total (s)   self (s)
+   16              0.000063   let tail = (a:patterns =~ a:comma .. "$" ? a:patterns : a:patterns .. a:comma)
+   16              0.000104   let i = matchend(tail, s:notslash .. a:comma)
+   16              0.000009   if a:0
+   16              0.000051     let alttail = (a:1 =~ a:comma .. "$" ? a:1 : a:1 .. a:comma)
+   16              0.000095     let j = matchend(alttail, s:notslash .. a:comma)
+   16              0.000005   endif
+   16              0.000027   let current = strpart(tail, 0, i-1)
+   16              0.000013   if a:branch == ""
+    8              0.000006     let currpat = current
+    8              0.000002   else
+    8              0.000086     let currpat = substitute(current, s:notslash .. a:branch, '\\|', 'g')
+   16              0.000005   endif
+                              " un-escape \, to ,
+   16              0.000038   let currpat = substitute(currpat, '\\,', ',', 'g')
+   46              0.000278   while a:string !~ a:prefix .. currpat .. a:suffix
+   30              0.000044     let tail = strpart(tail, i)
+   30              0.000141     let i = matchend(tail, s:notslash .. a:comma)
+   30              0.000019     if i == -1
+                                  return -1
+   30              0.000008     endif
+   30              0.000046     let current = strpart(tail, 0, i-1)
+   30              0.000021     if a:branch == ""
+    3              0.000002       let currpat = current
+   27              0.000007     else
+   27              0.000153       let currpat = substitute(current, s:notslash .. a:branch, '\\|', 'g')
+   30              0.000010     endif
+   30              0.000013     if a:0
+   30              0.000041       let alttail = strpart(alttail, j)
+   30              0.000133       let j = matchend(alttail, s:notslash .. a:comma)
+   30              0.000010     endif
+   46              0.000026   endwhile
+   16              0.000008   if a:0
+   16              0.000033     let current = current .. a:comma .. strpart(alttail, 0, j-1)
+   16              0.000005   endif
+   16              0.000010   return current
+
+FUNCTION  copilot#client#LspResponse()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:432
+Called 25 times
+Total time:   0.002348
+ Self time:   0.000254
+
+count  total (s)   self (s)
+   25              0.000064   if !has_key(s:instances, a:id)
+                                return
+   25              0.000009   endif
+   25   0.002231   0.000137   call s:OnResponse(s:instances[a:id], a:opts)
+
+FUNCTION  <SNR>57_Resolve()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:476
+Called 91 times
+Total time:   0.004647
+ Self time:   0.003776
+
+count  total (s)   self (s)
+   91              0.000080   let word = a:target
+   91              0.000378   let i = matchend(word, s:notslash .. '\\\d') - 1
+   91              0.000068   let table = "----------"
+   99              0.000076   while i != -2 " There are back references to be replaced.
+    8              0.000011     let d = word[i]
+    8   0.000459   0.000031     let backref = s:Ref(a:source, d)
+                                " The idea is to replace '\d' with backref.  Before we do this,
+                                " replace any \(\) groups in backref with :1, :2, ... if they
+                                " correspond to the first, second, ... group already inserted
+                                " into backref.  Later, replace :1 with \1 and so on.  The group
+                                " number w+b within backref corresponds to the group number
+                                " s within a:source.
+                                " w = number of '\(' in word before the current one
+    8   0.000189   0.000056     let w = s:Count( substitute(strpart(word, 0, i-1), '\\\\', '', 'g'), '\(', '1')
+    8              0.000005     let b = 1 " number of the current '\(' in backref
+    8              0.000006     let s = d " number of the current '\(' in a:source
+   16   0.000394   0.000084     while b <= s:Count(substitute(backref, '\\\\', '', 'g'), '\(', '1') && s < 10
+    8              0.000010       if table[s] == "-"
+    8              0.000006         if w + b < 10
+                                      " let table[s] = w + b
+    8              0.000026           let table = strpart(table, 0, s) .. (w+b) .. strpart(table, s+1)
+    8              0.000003         endif
+    8              0.000005         let b = b + 1
+    8              0.000008         let s = s + 1
+                                  else
+                                    execute s:Ref(backref, b, "start", "len")
+                                    let ref = strpart(backref, start, len)
+                                    let backref = strpart(backref, 0, start) .. ":" .. table[s] .. strpart(backref, start+len)
+                                    let s = s + s:Count(substitute(ref, '\\\\', '', 'g'), '\(', '1')
+    8              0.000002       endif
+   16              0.000005     endwhile
+    8              0.000021     let word = strpart(word, 0, i-1) .. backref .. strpart(word, i+1)
+    8              0.000035     let i = matchend(word, s:notslash .. '\\\d') - 1
+   99              0.000098   endwhile
+   91              0.000390   let word = substitute(word, s:notslash .. '\zs:', '\\', 'g')
+   91              0.000077   if a:output == "table"
+    3              0.000002     return table
+   88              0.000063   elseif a:output == "word"
+   88              0.000050     return word
+                              else
+                                return table .. word
+                              endif
+
+FUNCTION  copilot#OnBufEnter()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:443
+Called 8 times
+Total time:   0.000186
+ Self time:   0.000101
+
+count  total (s)   self (s)
+    8              0.000025   let bufnr = bufnr('')
+    8   0.000155   0.000069   call copilot#util#Defer(function('s:Focus'), bufnr)
+
+FUNCTION  13()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\autoload\provider\clipboard.vim:22
+Called 1 time
+Total time:   0.000023
+ Self time:   0.000023
+
+count  total (s)   self (s)
+                              " At this point this nvim instance might already have launched
+                              " a new provider instance. Don't drop ownership in this case.
+    1              0.000007   if self.owner == a:jobid
+    1              0.000004     let self.owner = 0
+    1              0.000001   endif
+                              " Don't print if exit code is >= 128 ( exit is 128+SIGNUM if by signal (e.g. 143 on SIGTERM))
+    1              0.000002   if a:data > 0 && a:data < 128
+                                echohl WarningMsg
+                                echomsg 'clipboard: error invoking '.get(self.argv, 0, '?').': '.join(self.stderr)
+                                echohl None
+    1              0.000000   endif
+
+FUNCTION  15()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\autoload\provider\clipboard.vim:286
+Called 1 time
+Total time:   0.029108
+ Self time:   0.029108
+
+count  total (s)   self (s)
+    1              0.000002   if a:reg == '"'
+                                call s:clipboard.set(a:lines,a:regtype,'+')
+                                if s:copy['*'] != s:copy['+']
+                                  call s:clipboard.set(a:lines,a:regtype,'*')
+                                end
+                                return 0
+    1              0.000000   end
+                            
+    1              0.000004   if s:cache_enabled == 0 || type(s:copy[a:reg]) == v:t_func
+                                if type(s:copy[a:reg]) == v:t_func
+                                  call s:copy[a:reg](a:lines, a:regtype)
+                                else
+                                  call s:try_cmd(s:copy[a:reg], a:lines)
+                                endif
+                                "Cache it anyway we can compare it later to get regtype of the yank
+                                let s:selections[a:reg] = copy(s:selection)
+                                let s:selections[a:reg].data = [a:lines, a:regtype]
+                                return 0
+    1              0.000000   end
+                            
+    1              0.000002   if s:selections[a:reg].owner > 0
+                                let prev_job = s:selections[a:reg].owner
+    1              0.000000   end
+    1              0.000009   let s:selections[a:reg] = copy(s:selection)
+    1              0.000002   let selection = s:selections[a:reg]
+    1              0.000002   let selection.data = [a:lines, a:regtype]
+    1              0.000002   let selection.argv = s:copy[a:reg]
+    1              0.000002   let selection.detach = s:cache_enabled
+    1              0.000001   let selection.cwd = "/"
+    1              0.028941   let jobid = jobstart(selection.argv, selection)
+    1              0.000009   if jobid > 0
+    1              0.000014     call jobsend(jobid, a:lines)
+    1              0.000053     call jobclose(jobid, 'stdin')
+                                " xclip does not close stdout when receiving input via stdin
+    1              0.000006     if selection.argv[0] ==# 'xclip'
+                                  call jobclose(jobid, 'stdout')
+    1              0.000001     endif
+    1              0.000003     let selection.owner = jobid
+    1              0.000001     let ret = 1
+                              else
+                                echohl WarningMsg
+                                echomsg 'clipboard: failed to execute: '.(s:copy[a:reg])
+                                echohl None
+                                let ret = 1
+    1              0.000000   endif
+                            
+                              " The previous provider instance should exit when the new one takes
+                              " ownership, but kill it to be sure we don't fill up the job table.
+    1              0.000002   if exists('prev_job')
+                                call timer_start(1000, {... -> jobwait([prev_job], 0)[0] == -1 && jobstop(prev_job)})
+    1              0.000000   endif
+                            
+    1              0.000002   return ret
+
+FUNCTION  copilot#client#Cancel()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:801
+Called 27 times
+Total time:   0.001130
+ Self time:   0.000326
+
+count  total (s)   self (s)
+   27              0.000132   if type(a:request) == type({}) && has_key(a:request, 'Cancel')
+   25   0.000956   0.000153     call a:request.Cancel()
+   27              0.000010   endif
+
+FUNCTION  <SNR>47_SetUpRequest()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:133
+Called 25 times
+Total time:   0.000847
+ Self time:   0.000847
+
+count  total (s)   self (s)
+   25              0.000347   let request = { 'client_id': a:instance.id, 'id': a:id, 'method': a:method, 'params': a:params, 'Client': function('s:RequestClient'), 'Wait': function('s:RequestWait'), 'Await': function('s:RequestAwait'), 'Cancel': function('s:RequestCancel'), 'resolve': [], 'reject': [], 'progress': a:progress, 'status': 'running'}
+   25              0.000042   let args = a:000[2:-1]
+   25              0.000033   if len(args)
+                                if !empty(a:1)
+                                  call add(request.resolve, { v -> call(a:1, [v] + args)})
+                                endif
+                                if !empty(a:2)
+                                  call add(request.reject, { v -> call(a:2, [v] + args)})
+                                endif
+                                return request
+   25              0.000009   endif
+   25              0.000028   if a:0 && !empty(a:1)
+                                call add(request.resolve, a:1)
+   25              0.000008   endif
+   25              0.000029   if a:0 > 1 && !empty(a:2)
+                                call add(request.reject, a:2)
+   25              0.000007   endif
+   25              0.000017   return request
+
+FUNCTION  <SNR>23_ParseOptions()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:166
+Called 10 times
+Total time:   0.000096
+ Self time:   0.000096
+
+count  total (s)   self (s)
+   10              0.000008   for option in a:declarations
+                                if has_key(s:modeline_booleans, matchstr(option, '^\%(no\)\=\zs\w\+$'))
+                                  let a:into[s:modeline_booleans[matchstr(option, '^\%(no\)\=\zs\w\+')]] = [option !~# '^no'] + a:000
+                                elseif has_key(s:modeline_numbers, matchstr(option, '^\w\+\ze=[1-9]\d*$'))
+                                  let a:into[s:modeline_numbers[matchstr(option, '^\w\+')]] = [str2nr(matchstr(option, '\d\+$'))] + a:000
+                                elseif option =~# '^\%(ft\|filetype\)=[[:alnum:]._-]*$'
+                                  let a:into.filetype = [matchstr(option, '=\zs.*')] + a:000
+                                endif
+                                if option ==# 'nomodeline' || option ==# 'noml'
+                                  return 1
+                                endif
+   10              0.000004   endfor
+   10              0.000004   return 0
+
+FUNCTION  <SNR>57_Ref()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:405
+Called 8 times
+Total time:   0.000428
+ Self time:   0.000428
+
+count  total (s)   self (s)
+    8              0.000014   let len = strlen(a:string)
+    8              0.000007   if a:d == 0
+                                let start = 0
+    8              0.000003   else
+    8              0.000006     let cnt = a:d
+    8              0.000006     let match = a:string
+   16              0.000010     while cnt
+    8              0.000007       let cnt = cnt - 1
+    8              0.000045       let index = matchend(match, s:notslash .. '\\(')
+    8              0.000006       if index == -1
+                                    return ""
+    8              0.000002       endif
+    8              0.000011       let match = strpart(match, index)
+   16              0.000007     endwhile
+    8              0.000011     let start = len - strlen(match)
+    8              0.000008     if a:0 == 1 && a:1 == "start"
+                                  return start - 2
+    8              0.000003     endif
+    8              0.000005     let cnt = 1
+   16              0.000008     while cnt
+    8              0.000050       let index = matchend(match, s:notslash .. '\\(\|\\)') - 1
+    8              0.000005       if index == -2
+                                    return ""
+    8              0.000002       endif
+                                  " Increment if an open, decrement if a ')':
+    8              0.000015       let cnt = cnt + (match[index]=="(" ? 1 : -1)  " ')'
+    8              0.000012       let match = strpart(match, index+1)
+   16              0.000006     endwhile
+    8              0.000006     let start = start - 2
+    8              0.000011     let len = len - start - strlen(match)
+    8              0.000003   endif
+    8              0.000005   if a:0 == 1
+                                return len
+    8              0.000005   elseif a:0 == 2
+                                return "let " .. a:1 .. "=" .. start .. "| let " .. a:2 .. "=" .. len
+    8              0.000002   else
+    8              0.000011     return strpart(a:string, start, len)
+                              endif
+
+FUNCTION  <SNR>47_RequestClient()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:122
+Called 25 times
+Total time:   0.000121
+ Self time:   0.000121
+
+count  total (s)   self (s)
+   25              0.000104   return get(s:instances, self.client_id, v:null)
+
+FUNCTION  copilot#client#Result()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:814
+Called 25 times
+Total time:   0.000204
+ Self time:   0.000204
+
+count  total (s)   self (s)
+   25              0.000046   if has_key(a:request, 'resolve')
+   25              0.000045     call add(a:request.resolve, a:callback)
+                              elseif has_key(a:request, 'result')
+                                let a:request.waiting[timer_start(0, function('s:Callback', [a:request, 'result', a:callback]))] = 1
+   25              0.000008   endif
+
+FUNCTION  <SNR>2_LoadIndent()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\indent.vim:14
+Called 17 times
+Total time:   0.054138
+ Self time:   0.054050
+
+count  total (s)   self (s)
+   17              0.000052     if exists("b:undo_indent")
+                                  exe b:undo_indent
+                                  unlet! b:undo_indent b:did_indent
+   17              0.000006     endif
+   17              0.000061     let s = expand("<amatch>")
+   17              0.000023     if s != ""
+   17              0.000023       if exists("b:did_indent")
+                            	unlet b:did_indent
+   17              0.000005       endif
+                            
+                                  " When there is a dot it is used to separate filetype names.  Thus for
+                                  " "aaa.bbb" load "indent/aaa.vim" and then "indent/bbb.vim".
+   34              0.000089       for name in split(s, '\.')
+                                    " XXX: "[.]" in the pattern makes it a wildcard on Windows
+   17   0.053645   0.053557         exe $'runtime! indent/{name}[.]{{vim,lua}}'
+   34              0.000059       endfor
+   17              0.000010     endif
+
+FUNCTION  copilot#OnInsertLeavePre()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:448
+Called 4 times
+Total time:   0.000890
+ Self time:   0.000035
+
+count  total (s)   self (s)
+    4   0.000832   0.000014   call copilot#Clear()
+    4   0.000054   0.000017   call s:ClearPreview()
+
+FUNCTION  <SNR>47_UriFromPath()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\client.vim:179
+Called 25 times
+Total time:   0.000642
+ Self time:   0.000642
+
+count  total (s)   self (s)
+   25              0.000035   let absolute = a:absolute
+   25              0.000188   if has('win32') && absolute =~# '^\a://\@!'
+                                return 'file:///' . strpart(absolute, 0, 2) . s:UrlEncode(strpart(absolute, 2))
+   25              0.000074   elseif absolute =~# '^/'
+                                return 'file://' . s:UrlEncode(absolute)
+   25              0.000171   elseif absolute =~# '^\a[[:alnum:].+-]*:\|^$'
+   25              0.000022     return absolute
+                              else
+                                return ''
+                              endif
+
+FUNCTION  <SNR>42_ClearPreview()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:297
+Called 94 times
+Total time:   0.001508
+ Self time:   0.001105
+
+count  total (s)   self (s)
+   94              0.000096   if s:has_nvim_ghost_text
+   94   0.000931   0.000528     call nvim_buf_del_extmark(0, copilot#NvimNs(), 1)
+                              elseif s:has_vim_ghost_text
+                                call prop_remove({'type': s:hlgroup, 'all': v:true})
+                                call prop_remove({'type': s:annot_hlgroup, 'all': v:true})
+   94              0.000032   endif
+
+FUNCTION  copilot#util#Defer()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot\util.vim:7
+Called 37 times
+Total time:   0.000335
+ Self time:   0.000335
+
+count  total (s)   self (s)
+   37              0.000137   call add(s:deferred, function(a:fn, a:000))
+   37              0.000171   return timer_start(0, function('s:RunDeferred'))
+
+FUNCTION  copilot#Schedule()
+    Defined: ~\AppData\Local\nvim-data\lazy\copilot.vim\autoload\copilot.vim:412
+Called 61 times
+Total time:   0.015075
+ Self time:   0.001642
+
+count  total (s)   self (s)
+   61   0.004244   0.000542   if !s:has_ghost_text || !s:Running() || !copilot#Enabled()
+   12   0.002114   0.000041     call copilot#Clear()
+   12              0.000005     return
+   49              0.000016   endif
+   49   0.007903   0.000245   call s:UpdatePreview()
+   49              0.000105   let delay = get(g:, 'copilot_idle_delay', 45)
+   49              0.000141   call timer_stop(get(g:, '_copilot_timer', -1))
+   49              0.000351   let g:_copilot_timer = timer_start(delay, function('s:Trigger', [bufnr('')]))
+
+FUNCTION  <SNR>23_Ready()
+    Defined: ~/AppData/Local/nvim-data/lazy/vim-sleuth/plugin/sleuth.vim:384
+Called 4 times
+Total time:   0.000010
+ Self time:   0.000010
+
+count  total (s)   self (s)
+    4              0.000008   return has_key(a:detected.options, 'expandtab') && has_key(a:detected.options, 'shiftwidth')
+
+FUNCTION  <SNR>57_Wholematch()
+    Defined: C:\Program Files\Neovim\share\nvim\runtime\pack\dist\opt\matchit\autoload\matchit.vim:385
+Called 8 times
+Total time:   0.000531
+ Self time:   0.000531
+
+count  total (s)   self (s)
+    8              0.000017   let group = '\%(' .. a:pat .. '\)'
+    8              0.000016   let prefix = (a:start ? '\(^.*\%<' .. (a:start + 2) .. 'c\)\zs' : '^')
+    8              0.000011   let len = strlen(a:string)
+    8              0.000015   let suffix = (a:start+1 < len ? '\(\%>' .. (a:start+1) .. 'c.*$\)\@=' : '$')
+    8              0.000438   if a:string !~ prefix .. group .. suffix
+    2              0.000002     let prefix = ''
+    8              0.000002   endif
+    8              0.000014   return prefix .. group .. suffix
+
+FUNCTIONS SORTED ON TOTAL TIME
+count  total (s)   self (s)  function
+   17   0.169061   0.154527  <SNR>1_LoadFTPlugin()
+   17   0.100190             <SNR>41_SynSet()
+   17   0.054138   0.054050  <SNR>2_LoadIndent()
+    1   0.029152   0.000044  provider#clipboard#Call()
+    1   0.029108             15()
+    8   0.022294   0.008448  matchit#Match_wrapper()
+  111   0.019055   0.001479  <SNR>10_Event()
+   61   0.015075   0.001642  copilot#Schedule()
+   25   0.014642   0.000977  <SNR>42_Trigger()
+   57   0.014478   0.000363  copilot#OnCursorMovedI()
+   90   0.013811   0.007488  <SNR>42_UpdatePreview()
+   25   0.013665   0.000687  copilot#Suggest()
+   25   0.012806   0.001992  copilot#Complete()
+   74   0.009910   0.000797  <SNR>43_RunDeferred()
+   25   0.008483   0.000341  copilot#Request()
+    8   0.008212   0.003673  <SNR>57_ParseWords()
+   25   0.007738   0.000815  <SNR>47_NvimRequest()
+    2   0.007378   0.000014  <SNR>23_AutoInit()
+    2   0.007364   0.000137  <SNR>23_Init()
+   25   0.006022   0.005065  <SNR>47_NvimDoRequest()
+
+FUNCTIONS SORTED ON SELF TIME
+count  total (s)   self (s)  function
+   17   0.169061   0.154527  <SNR>1_LoadFTPlugin()
+   17              0.100190  <SNR>41_SynSet()
+   17   0.054138   0.054050  <SNR>2_LoadIndent()
+    1              0.029108  15()
+    8   0.022294   0.008448  matchit#Match_wrapper()
+   90   0.013811   0.007488  <SNR>42_UpdatePreview()
+    2              0.005088  <SNR>23_Guess()
+   25   0.006022   0.005065  <SNR>47_NvimDoRequest()
+   90   0.004852   0.004623  <SNR>42_SuggestionTextWithAdjustments()
+   91   0.004647   0.003776  <SNR>57_Resolve()
+    8   0.008212   0.003673  <SNR>57_ParseWords()
+   78              0.003640  <SNR>42_BufferDisabled()
+   25   0.005660   0.002776  <SNR>47_PreprocessParams()
+   29   0.004214   0.002121  <SNR>47_NvimAttach()
+   25   0.012806   0.001992  copilot#Complete()
+   16              0.001788  <SNR>57_Choose()
+   61   0.015075   0.001642  copilot#Schedule()
+    8   0.002126   0.001618  <SNR>57_InsertRefs()
+  111   0.019055   0.001479  <SNR>10_Event()
+   25   0.001265   0.001185  <SNR>47_RejectRequest()
+
